@@ -40,7 +40,7 @@ public struct __PushConstants_Compute
     public uint64_t computeData;
 };
 
-[[vk::push_constant]] __PushConstants_Graphics __push_graphics;
+public [[vk::push_constant]] __PushConstants_Graphics __push_graphics;
 [[vk::push_constant]] __PushConstants_Compute __push_compute;
 
 // Standard Vulkan indirect draw command structure

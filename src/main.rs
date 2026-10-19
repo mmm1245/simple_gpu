@@ -4,7 +4,9 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     ffi::{CStr, CString},
     marker::PhantomData,
+    ops::{Add, Rem, Sub},
     sync::{Arc, Mutex, Weak},
+    time::Instant,
 };
 
 use ash::{
@@ -25,9 +27,27 @@ use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle},
+    raw_window_handle::{
+        DisplayHandle, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+        WindowHandle,
+    },
     window::WindowId,
 };
+
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct Vertex {
+    pos: [f32; 3],
+    color: [f32; 3],
+}
+
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct DrawConstants {
+    vertex_data: u64,
+    time: f32,
+    _pad: u32,
+}
 
 #[derive(Default)]
 struct App {
@@ -38,13 +58,18 @@ struct AppData {
     gpu: Arc<GPU>,
     swapchain: GPUSwapchain,
     semaphore: GPUSemaphore,
-    bump_value: u64,
-    vertex_shader: GPUShader,
-    fragment_shader: GPUShader,
+    next_frame: u64,
+    shaders: GraphicsShaders,
+    frame_arenas: [GPUArena; 3],
+    start_time: Instant,
+    desc_heap: GPUDescriptorHeap,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.data.is_some() {
+            return;
+        }
         let window = event_loop
             .create_window(winit::window::Window::default_attributes())
             .unwrap();
@@ -59,38 +84,64 @@ impl ApplicationHandler for App {
                 .map(|ptr| unsafe { CStr::from_ptr(ptr).to_str().unwrap() })
                 .collect::<Vec<_>>()
         );
-        let gpu = GPU::init().unwrap();
+        let gpu = GPU::init(Default::default()).unwrap();
         let semaphore = gpu.create_semaphore(0);
         let swapchain = gpu.create_swapchain(
-            window.display_handle().unwrap(),
-            window.window_handle().unwrap(),
+            window.display_handle().unwrap().as_raw(),
+            window.window_handle().unwrap().as_raw(),
         );
         let shader = include_bytes!("shader.spv");
-        println!("{}", shader.len());
-        let vertex_shader = gpu
-            .create_shader_spirv(
-                shader,
-                "vertexMain",
-                GPUShaderKind::Vertex,
-                Default::default(),
-            )
+        let shaders = gpu
+            .create_shaders_graphic_spirv(shader, "vertexMain", "fragmentMain", &Default::default())
             .unwrap();
-        let fragment_shader = gpu
-            .create_shader_spirv(
-                shader,
-                "fragmentMain",
-                GPUShaderKind::Fragment,
-                Default::default(),
-            )
-            .unwrap();
+        let frame_arenas = std::array::from_fn(|_| gpu.allocate_arena(1024 * 1024 * 8));
+        let mut desc_heap = gpu.create_descriptor_heap();
+        desc_heap.set_samplers(
+            0,
+            &[TextureSampler {
+                ..Default::default()
+            }],
+        );
+        let mut upload_semaphore = gpu.create_semaphore(0);
+        let image = image::open("image.png").unwrap().into_rgba8();
+        let mut image_buffer = image
+            .pixels()
+            .map(|rgba| rgba.0.into_iter())
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut texture = gpu.create_texture(
+            TextureDesc {
+                dimensions: [image.width(), image.height(), 1],
+                usage: TextureUsage::SAMPLED,
+                ..Default::default()
+            },
+            QueueKind::Main,
+            &upload_semaphore,
+            1,
+        );
+        let mut upload_arena = gpu.allocate_arena(4 * 1024 * 1024);
+        let mut upload_buffer = gpu.begin_commands(QueueKind::Main);
+        upload_buffer.add_wait(&upload_semaphore, 1);
+        upload_buffer.add_signal(&upload_semaphore, 2);
+        upload_buffer.copy_to_texture(
+            &texture,
+            TextureRegion::default(),
+            upload_arena.alloc(image_buffer.as_slice()),
+        );
+        upload_buffer.submit();
+        upload_semaphore.wait(2);
+        desc_heap.set_textures(1, &[(&texture, TextureViewDesc::default())]);
+
         self.data = Some(AppData {
+            frame_arenas,
             window,
             gpu,
             swapchain,
             semaphore,
-            bump_value: 1,
-            vertex_shader,
-            fragment_shader,
+            next_frame: 1,
+            shaders,
+            start_time: Instant::now(),
+            desc_heap,
         });
     }
 
@@ -102,9 +153,33 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let Some(data) = &mut self.data else { return };
+                if data.next_frame > 3 {
+                    data.semaphore.wait(data.next_frame - 3);
+                }
+
+                let frame_arena = &mut data.frame_arenas[data.next_frame as usize % 3];
+                frame_arena.clear();
+                let time = data.start_time.elapsed().as_secs_f32();
+                let mod_time = time.rem(2.).sub(1.).abs();
+                let vertices = frame_arena.alloc(&[
+                    Vertex {
+                        pos: [0., 0., 0.],
+                        color: [mod_time, 0., 0.],
+                    },
+                    Vertex {
+                        pos: [1., 0., 0.],
+                        color: [0., mod_time, 0.],
+                    },
+                    Vertex {
+                        pos: [1., 1., 0.],
+                        color: [0., 0., mod_time],
+                    },
+                ]);
+
                 let mut commands = data.gpu.begin_commands(QueueKind::Main);
+                commands.bind_descriptor_heap(&data.desc_heap);
                 let target = data.swapchain.acquire_next();
-                if true {
+                {
                     let mut render_pass = commands.begin_render(RenderPassDesc {
                         color_attachments: &[RenderPassAttachment {
                             load: RenderPassLoadOp::Clear([1., 1., 0., 1.]),
@@ -115,20 +190,37 @@ impl ApplicationHandler for App {
                         }],
                         ..Default::default()
                     });
-                    render_pass.set_shaders(&data.vertex_shader, &data.fragment_shader);
-                    render_pass.draw(0, 0, 3, 1);
+                    render_pass.set_shaders(&data.shaders);
+                    render_pass.draw(
+                        DrawConstants {
+                            vertex_data: vertices.gpu(),
+                            time,
+                            _pad: 0,
+                        },
+                        3,
+                        1,
+                        Default::default(),
+                    );
                 }
-                commands.add_signal(&data.semaphore, data.bump_value);
+                commands.add_signal(&data.semaphore, data.next_frame);
                 commands.submit();
 
-                data.swapchain
-                    .present(QueueKind::Main, &data.semaphore, data.bump_value);
+                match data
+                    .swapchain
+                    .present(QueueKind::Main, &data.semaphore, data.next_frame)
+                {
+                    SwapchainPresentResult::Ok => {}
+                    SwapchainPresentResult::Suboptimal => {
+                        data.swapchain.resize();
+                    }
+                }
 
-                data.bump_value += 1;
+                data.next_frame += 1;
                 //println!("frame rendered {}", self.bump_value);
 
                 data.window.request_redraw();
             }
+            WindowEvent::Resized(new_size) => {}
             _ => (),
         }
     }
@@ -156,11 +248,14 @@ pub struct GPU {
     command_buffer_counters: Mutex<[u64; 3]>,
     allocator: Mutex<Allocator>,
     thread_local: ThreadLocal<RefCell<GPUThreadLocalStorage>>,
-    graphics_common_pipeline_layout: vk::PipelineLayout,
+    common_pipeline_graphics_layout: vk::PipelineLayout,
+    common_pipeline_compute_layout: vk::PipelineLayout,
+    descriptor_layouts: Vec<vk::DescriptorSetLayout>,
+    settings: GPUSettings,
     weak: Weak<GPU>,
 }
 impl GPU {
-    pub fn init() -> VkResult<Arc<GPU>> {
+    pub fn init(settings: GPUSettings) -> VkResult<Arc<GPU>> {
         unsafe {
             let entry = Entry::linked();
             let app_info = vk::ApplicationInfo {
@@ -170,11 +265,14 @@ impl GPU {
             let mut enabled_extension_instance_names = vec![];
             enabled_extension_instance_names.push(ash::khr::surface::NAME.as_ptr());
             enabled_extension_instance_names.push(ash::khr::xlib_surface::NAME.as_ptr());
+            let mut enabled_layer_names = Vec::new();
+            enabled_layer_names.push("VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8);
             let create_info = vk::InstanceCreateInfo {
                 p_application_info: &app_info,
                 ..Default::default()
             }
-            .enabled_extension_names(&enabled_extension_instance_names);
+            .enabled_extension_names(&enabled_extension_instance_names)
+            .enabled_layer_names(&enabled_layer_names);
             let instance = entry.create_instance(&create_info, None)?;
 
             let physical_device = instance
@@ -317,17 +415,99 @@ impl GPU {
             })
             .unwrap();
 
-            let graphics_common_pipeline_layout = unsafe {
+            let mut descriptor_layouts = Vec::new();
+            {
+                let bind_flags = vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                    | vk::DescriptorBindingFlags::PARTIALLY_BOUND;
+                let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                    .binding_flags(std::slice::from_ref(&bind_flags));
+                {
+                    let binding = vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_count(settings.desc_heap_max_textures as u32)
+                        .stage_flags(
+                            vk::ShaderStageFlags::VERTEX
+                                | vk::ShaderStageFlags::FRAGMENT
+                                | vk::ShaderStageFlags::COMPUTE,
+                        );
+                    let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(&mut flags_info)
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+                        .bindings(std::slice::from_ref(&binding));
+                    descriptor_layouts.push(
+                        device
+                            .create_descriptor_set_layout(&create_info, None)
+                            .unwrap(),
+                    );
+                }
+                {
+                    let binding = vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .descriptor_count(settings.desc_heap_max_textures as u32)
+                        .stage_flags(
+                            vk::ShaderStageFlags::VERTEX
+                                | vk::ShaderStageFlags::FRAGMENT
+                                | vk::ShaderStageFlags::COMPUTE,
+                        );
+                    let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(&mut flags_info)
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+                        .bindings(std::slice::from_ref(&binding));
+                    descriptor_layouts.push(
+                        device
+                            .create_descriptor_set_layout(&create_info, None)
+                            .unwrap(),
+                    );
+                }
+                {
+                    let binding = vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .descriptor_count(settings.desc_heap_max_samplers as u32)
+                        .stage_flags(
+                            vk::ShaderStageFlags::VERTEX
+                                | vk::ShaderStageFlags::FRAGMENT
+                                | vk::ShaderStageFlags::COMPUTE,
+                        );
+                    let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(&mut flags_info)
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+                        .bindings(std::slice::from_ref(&binding));
+                    descriptor_layouts.push(
+                        device
+                            .create_descriptor_set_layout(&create_info, None)
+                            .unwrap(),
+                    );
+                }
+            }
+
+            let common_pipeline_graphics_layout = unsafe {
                 device
                     .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&[
-                            vk::PushConstantRange {
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(&descriptor_layouts)
+                            .push_constant_ranges(&[vk::PushConstantRange {
                                 offset: 0,
-                                size: std::mem::size_of::<GraphicsShaderPushConstants>() as u32,
+                                size: settings.max_push_constant_size as u32,
                                 stage_flags: vk::ShaderStageFlags::VERTEX
                                     | vk::ShaderStageFlags::FRAGMENT,
-                            },
-                        ]),
+                            }]),
+                        None,
+                    )
+                    .unwrap()
+            };
+            let common_pipeline_compute_layout = unsafe {
+                device
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(&descriptor_layouts)
+                            .push_constant_ranges(&[vk::PushConstantRange {
+                                offset: 0,
+                                size: settings.max_push_constant_size as u32,
+                                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                            }]),
                         None,
                     )
                     .unwrap()
@@ -346,11 +526,14 @@ impl GPU {
                 command_buffer_semaphores: std::array::from_fn(|_| {
                     GPUSemaphore::create_raw(&device, weak, 0)
                 }),
-                graphics_common_pipeline_layout,
+                common_pipeline_graphics_layout,
+                common_pipeline_compute_layout,
+                descriptor_layouts,
                 weak: weak.clone(),
                 device,
                 instance,
                 entry,
+                settings,
             }))
         }
     }
@@ -411,18 +594,40 @@ impl GPU {
     pub fn allocate_buffer_with<T: bytemuck::Pod>(&self, data: &[T]) -> GPUBuffer {
         let mut buffer =
             self.allocate_buffer(Layout::array::<T>(data.len()).unwrap(), MemoryKind::Default);
-        buffer.upload(data);
+        buffer.upload(0, data);
         buffer
     }
     pub fn create_semaphore(&self, value: u64) -> GPUSemaphore {
         GPUSemaphore::create_raw(&self.device, &self.weak, value)
+    }
+    pub fn create_shaders_graphic_spirv(
+        &self,
+        code: &[u8],
+        entry_point_vertex: &str,
+        entry_point_fragment: &str,
+        specializations: &HashMap<u32, u32>,
+    ) -> VkResult<GraphicsShaders> {
+        Ok(GraphicsShaders {
+            vertex: self.create_shader_spirv(
+                code,
+                entry_point_vertex,
+                GPUShaderKind::Vertex,
+                specializations,
+            )?,
+            fragment: self.create_shader_spirv(
+                code,
+                entry_point_fragment,
+                GPUShaderKind::Fragment,
+                specializations,
+            )?,
+        })
     }
     pub fn create_shader_spirv(
         &self,
         code: &[u8],
         entry_point: &str,
         kind: GPUShaderKind,
-        specializations: HashMap<u32, u32>,
+        specializations: &HashMap<u32, u32>,
     ) -> VkResult<GPUShader> {
         let mut aligned_code = vec![0u32; code.len().div_ceil(4)];
         let aligned_code =
@@ -442,13 +647,13 @@ impl GPU {
         push_constants.push(match kind {
             GPUShaderKind::Vertex | GPUShaderKind::Fragment => vk::PushConstantRange {
                 offset: 0,
-                size: std::mem::size_of::<GraphicsShaderPushConstants>() as u32,
+                size: self.settings.max_push_constant_size as u32,
                 stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             },
             GPUShaderKind::Compute { .. } => vk::PushConstantRange {
                 offset: 0,
-                size: std::mem::size_of::<ComputeShaderPushConstants>() as u32,
-                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                size: self.settings.max_push_constant_size as u32,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
             },
         });
         //todo: compute specializations
@@ -456,11 +661,11 @@ impl GPU {
         let mut specialization_map = Vec::new();
         for (constant_id, data) in specializations {
             specialization_map.push(vk::SpecializationMapEntry {
-                constant_id,
+                constant_id: *constant_id,
                 offset: (specialization_data.len() * 4) as u32,
                 size: 4,
             });
-            specialization_data.push(data);
+            specialization_data.push(*data);
         }
         let mut specialization_info = vk::SpecializationInfo::default()
             .map_entries(&specialization_map)
@@ -473,7 +678,8 @@ impl GPU {
             .stage(stage)
             .next_stage(next_stage)
             .push_constant_ranges(&push_constants)
-            .specialization_info(&specialization_info);
+            .specialization_info(&specialization_info)
+            .set_layouts(&self.descriptor_layouts);
         let shader = unsafe {
             self.shader_object_device
                 .create_shaders(&[shader_create_info], None)
@@ -548,11 +754,35 @@ impl GPU {
             _marker: PhantomData,
         }
     }
-    pub fn create_texture(&self, desc: TextureDesc) -> GPUTexture {
+    pub fn create_texture(
+        &self,
+        desc: TextureDesc,
+        queue: QueueKind,
+        semaphore: &GPUSemaphore,
+        wait_value: u64,
+    ) -> GPUTexture {
+        let mut usage = vk::ImageUsageFlags::TRANSFER_DST;
+        if desc.usage & TextureUsage::TRANSFER_SRC != 0 {
+            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        if desc.usage & TextureUsage::SAMPLED != 0 {
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
+        if desc.usage & TextureUsage::STORAGE != 0 {
+            usage |= vk::ImageUsageFlags::STORAGE;
+        }
+        if desc.usage & TextureUsage::COLOR_ATTACHMENT != 0 {
+            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if desc.usage & TextureUsage::DEPTH_STENCIL_ATTACHMENT != 0 {
+            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        }
         let image = unsafe {
             self.device
                 .create_image(
                     &&vk::ImageCreateInfo::default()
+                        .array_layers(desc.layer_count)
+                        .initial_layout(vk::ImageLayout::UNDEFINED)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .samples(to_vk_sample_count(desc.sample_count))
                         .format(desc.format.to_vk())
@@ -564,15 +794,7 @@ impl GPU {
                             | TextureType::CubeArray => vk::ImageType::TYPE_2D,
                             TextureType::D3 => vk::ImageType::TYPE_3D,
                         })
-                        .usage(
-                            //todo: proper usage
-                            vk::ImageUsageFlags::TRANSFER_DST
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::SAMPLED
-                                | vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::COLOR_ATTACHMENT
-                                | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                        )
+                        .usage(usage)
                         .extent(vk::Extent3D {
                             width: desc.dimensions[0],
                             height: desc.dimensions[1],
@@ -589,6 +811,48 @@ impl GPU {
                 )
                 .unwrap()
         };
+        let image_requirements = unsafe { self.device.get_image_memory_requirements(image) };
+        let allocation = self
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate(&AllocationCreateDesc {
+                name: "",
+                requirements: image_requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })
+            .unwrap();
+        unsafe {
+            self.device
+                .bind_image_memory(image, allocation.memory(), allocation.offset())
+        }
+        .unwrap();
+        let mut command_buffer = self.begin_commands(queue);
+        let image_barrier = vk::ImageMemoryBarrier2::default()
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: desc.format.to_vk_aspect_flags(),
+                layer_count: desc.layer_count,
+                level_count: desc.mip_count,
+                base_array_layer: 0,
+                base_mip_level: 0,
+            })
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
+        unsafe {
+            self.device.cmd_pipeline_barrier2(
+                command_buffer.command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&[image_barrier]),
+            )
+        };
+        command_buffer.add_signal(semaphore, wait_value);
+        command_buffer.submit();
         GPUTexture {
             texture_type: desc.texture_type,
             dimensions: desc.dimensions,
@@ -597,21 +861,22 @@ impl GPU {
             layer_count: desc.layer_count,
             sample_count: desc.sample_count,
             image,
+            allocation: Some(allocation),
             view_cache: Default::default(),
             gpu: self.weak.clone(),
         }
     }
     pub fn create_swapchain(
         &self,
-        display_handle: DisplayHandle,
-        window_handle: WindowHandle,
+        display_handle: RawDisplayHandle,
+        window_handle: RawWindowHandle,
     ) -> GPUSwapchain {
         unsafe {
             let surface = ash_window::create_surface(
                 &self.entry,
                 &self.instance,
-                display_handle.as_raw(),
-                window_handle.as_raw(),
+                display_handle,
+                window_handle,
                 None,
             )
             .unwrap();
@@ -685,6 +950,7 @@ impl GPU {
                         layer_count: 1,
                         sample_count: 1,
                         mip_count: 1,
+                        allocation: None,
                         view_cache: Default::default(),
                         gpu: self.weak.clone(),
                         texture_type: TextureType::D2,
@@ -701,7 +967,62 @@ impl GPU {
                 textures,
                 next_swap_image: 0,
                 gpu: self.weak.clone(),
+                display_handle,
+                window_handle,
             }
+        }
+    }
+    pub fn allocate_arena(&self, block_size: usize) -> GPUArena {
+        let memory = MemoryKind::Default;
+        GPUArena {
+            gpu: self.weak.clone(),
+            memory,
+            block_size,
+            blocks: vec![
+                self.allocate_buffer(Layout::from_size_align(block_size, 16).unwrap(), memory),
+            ],
+            block_offset: 0,
+            block_index: 0,
+        }
+    }
+    pub fn create_descriptor_heap(&self) -> GPUDescriptorHeap {
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: self.settings.desc_heap_max_textures as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: self.settings.desc_heap_max_textures as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: self.settings.desc_heap_max_samplers as u32,
+            },
+        ];
+        let pool_create_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(3)
+            .flags(
+                vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET
+                    | vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND,
+            );
+        let pool = unsafe {
+            self.device
+                .create_descriptor_pool(&pool_create_info, None)
+                .unwrap()
+        };
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&self.descriptor_layouts);
+        let desc_sets = unsafe { self.device.allocate_descriptor_sets(&alloc_info).unwrap() };
+        GPUDescriptorHeap {
+            gpu: self.weak.clone(),
+            pool,
+            textures: desc_sets[0],
+            textures_rw: desc_sets[1],
+            samplers: desc_sets[2],
+            sampler_cache: HashMap::new(),
         }
     }
 }
@@ -712,16 +1033,18 @@ pub struct TextureDesc {
     pub mip_count: u32,
     pub layer_count: u32,
     pub sample_count: u32,
+    pub usage: u8,
 }
 impl Default for TextureDesc {
     fn default() -> Self {
         TextureDesc {
             texture_type: TextureType::D2,
-            dimensions: [0; 3],
+            dimensions: [1; 3],
             format: TextureFormat::RGBA8Unorm,
             mip_count: 1,
             layer_count: 1,
             sample_count: 1,
+            usage: 0,
         }
     }
 }
@@ -835,6 +1158,12 @@ impl GPUCommandBuffer {
             if let Some(depth_attachment) = &depth_attachment {
                 info = info.depth_attachment(depth_attachment);
             }
+            let stencil_attachment = desc
+                .stencil_attachment
+                .map(|stencil_attachment| create_vk_attachment(&stencil_attachment));
+            if let Some(stencil_attachment) = &stencil_attachment {
+                info = info.stencil_attachment(stencil_attachment);
+            }
             gpu.device.cmd_begin_rendering(self.command_buffer, &info);
             gpu.device
                 .cmd_set_stencil_test_enable(self.command_buffer, false);
@@ -927,6 +1256,65 @@ impl GPUCommandBuffer {
             command_buffer: self,
         }
     }
+    pub fn copy_to_texture(
+        &mut self,
+        texture: &GPUTexture,
+        texture_region: TextureRegion,
+        src: GPUPointer,
+    ) {
+        let gpu = self.gpu.upgrade().unwrap();
+        let aspect_mask = texture.format.to_vk_aspect_flags();
+        let is_compressed = match texture.format {
+            TextureFormat::BC1RGBAUnorm
+            | TextureFormat::BC3RGBAUnorm
+            | TextureFormat::BC7RGBAUnorm
+            | TextureFormat::ASTC4x4RGBAUnorm
+            | TextureFormat::ETC2RGB8Unorm
+            | TextureFormat::ETC2RGBA8Unorm
+            | TextureFormat::EACR11Unorm
+            | TextureFormat::EACRG11Unorm => true,
+            _ => false,
+        };
+        let mip_width = 1.max(texture.dimensions[0] >> texture_region.mip_level);
+        let mip_height = 1.max(texture.dimensions[1] >> texture_region.mip_level);
+        let mip_depth = 1.max(texture.dimensions[2] >> texture_region.mip_level);
+        let copy_extent: [u32; 3] = std::array::from_fn(|i| {
+            if texture_region.size[i] != 0 {
+                texture_region.size[i]
+            } else {
+                [mip_width, mip_height, mip_depth][i]
+            }
+        });
+        let copy_info = vk::BufferImageCopy::default()
+            .buffer_offset(src.offset)
+            .buffer_row_length(if is_compressed { 0 } else { mip_width })
+            .buffer_image_height(if is_compressed { 0 } else { mip_height })
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask,
+                base_array_layer: texture_region.base_layer,
+                layer_count: texture_region.layer_count,
+                mip_level: texture_region.mip_level,
+            })
+            .image_offset(vk::Offset3D {
+                x: texture_region.offset[0],
+                y: texture_region.offset[1],
+                z: texture_region.offset[2],
+            })
+            .image_extent(vk::Extent3D {
+                width: copy_extent[0],
+                height: copy_extent[1],
+                depth: copy_extent[2],
+            });
+        unsafe {
+            gpu.device.cmd_copy_buffer_to_image(
+                self.command_buffer,
+                src.buffer,
+                texture.image,
+                vk::ImageLayout::GENERAL,
+                std::slice::from_ref(&copy_info),
+            )
+        };
+    }
     pub fn submit(mut self) {
         self.submitted = true;
         let gpu = self.gpu.upgrade().unwrap();
@@ -982,11 +1370,33 @@ impl GPUCommandBuffer {
             },
         );
     }
+    pub fn bind_descriptor_heap(&self, heap: &GPUDescriptorHeap) {
+        let gpu = self.gpu.upgrade().unwrap();
+        let descriptor_sets = [heap.textures, heap.textures_rw, heap.samplers];
+        unsafe {
+            gpu.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                gpu.common_pipeline_graphics_layout,
+                0,
+                &descriptor_sets,
+                &[],
+            );
+            gpu.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                gpu.common_pipeline_compute_layout,
+                0,
+                &descriptor_sets,
+                &[],
+            );
+        };
+    }
 }
 impl Drop for GPUCommandBuffer {
     fn drop(&mut self) {
         if !self.submitted {
-            panic!("buffer not submitted")
+            println!("buffer not submitted")
         }
     }
 }
@@ -994,7 +1404,7 @@ pub struct GPURenderPass<'a> {
     command_buffer: &'a mut GPUCommandBuffer,
 }
 impl GPURenderPass<'_> {
-    pub fn set_shaders(&mut self, vertex: &GPUShader, fragment: &GPUShader) {
+    pub fn set_shaders_individual(&mut self, vertex: &GPUShader, fragment: &GPUShader) {
         let gpu = self.command_buffer.gpu.upgrade().unwrap();
         unsafe {
             gpu.shader_object_device.cmd_bind_shaders(
@@ -1004,25 +1414,28 @@ impl GPURenderPass<'_> {
             )
         };
     }
-    pub fn draw(
+    pub fn set_shaders(&mut self, shaders: &GraphicsShaders) {
+        self.set_shaders_individual(&shaders.vertex, &shaders.fragment);
+    }
+    pub fn draw<D: bytemuck::Pod>(
         &mut self,
-        vertex_data: vk::DeviceAddress,
-        fragment_data: vk::DeviceAddress,
+        draw_data: D,
         vertex_count: u32,
         instance_count: u32,
+        draw_options: DrawOptions,
     ) {
         let gpu = self.command_buffer.gpu.upgrade().unwrap();
+        assert!(
+            std::mem::size_of::<D>() <= gpu.settings.max_push_constant_size,
+            "draw data size greater than set size"
+        );
         unsafe {
             gpu.device.cmd_push_constants(
                 self.command_buffer.command_buffer,
-                gpu.graphics_common_pipeline_layout,
+                gpu.common_pipeline_graphics_layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
-                bytemuck::bytes_of(&GraphicsShaderPushConstants {
-                    vertex_data,
-                    fragment_data,
-                    indirect_data: 0,
-                }),
+                bytemuck::bytes_of(&draw_data),
             );
             gpu.device.cmd_draw(
                 self.command_buffer.command_buffer,
@@ -1043,6 +1456,12 @@ impl Drop for GPURenderPass<'_> {
         }
     }
 }
+pub struct DrawOptions {}
+impl Default for DrawOptions {
+    fn default() -> Self {
+        DrawOptions {}
+    }
+}
 pub struct RenderPassDesc<'a> {
     render_area_offset: [i32; 2],
     render_area_size: [u32; 2],
@@ -1050,7 +1469,7 @@ pub struct RenderPassDesc<'a> {
     view_mask: u32,
     color_attachments: &'a [RenderPassAttachment<'a, [f32; 4]>],
     depth_attachment: Option<RenderPassAttachment<'a, f32>>,
-    //stencil_attachment: Option<RenderPassAttachment<'a>>,
+    stencil_attachment: Option<RenderPassAttachment<'a, u32>>,
 }
 impl Default for RenderPassDesc<'_> {
     fn default() -> Self {
@@ -1061,6 +1480,7 @@ impl Default for RenderPassDesc<'_> {
             view_mask: 0,
             color_attachments: &[],
             depth_attachment: None,
+            stencil_attachment: None,
         }
     }
 }
@@ -1087,6 +1507,16 @@ impl IntoClearValue for f32 {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: self,
                 stencil: 0,
+            },
+        }
+    }
+}
+impl IntoClearValue for u32 {
+    fn into_clear_value(self, format: TextureFormat) -> vk::ClearValue {
+        vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 0.,
+                stencil: self,
             },
         }
     }
@@ -1179,6 +1609,16 @@ enum TextureFormat {
     EACRG11Unorm,
 }
 impl TextureFormat {
+    fn to_vk_aspect_flags(self) -> vk::ImageAspectFlags {
+        match self {
+            TextureFormat::D16Unorm
+            | TextureFormat::D16UnormS8Uint
+            | TextureFormat::D24UnormPack32
+            | TextureFormat::D24UnormS8Uint
+            | TextureFormat::D32Float => vk::ImageAspectFlags::DEPTH,
+            _ => vk::ImageAspectFlags::COLOR,
+        }
+    }
     fn to_vk(self) -> vk::Format {
         match self {
             TextureFormat::R8Unorm => vk::Format::R8_UNORM,
@@ -1229,6 +1669,7 @@ struct GPUTexture {
     sample_count: u32,
     image: vk::Image,
     view_cache: Mutex<HashMap<TextureViewDesc, vk::ImageView>>,
+    allocation: Option<Allocation>,
     gpu: Weak<GPU>,
 }
 impl GPUTexture {
@@ -1251,14 +1692,7 @@ impl GPUTexture {
                                 .view_type(self.texture_type.to_view_vk())
                                 .format(self.format.to_vk())
                                 .subresource_range(vk::ImageSubresourceRange {
-                                    aspect_mask: match self.format {
-                                        TextureFormat::D16Unorm
-                                        | TextureFormat::D16UnormS8Uint
-                                        | TextureFormat::D24UnormPack32
-                                        | TextureFormat::D24UnormS8Uint
-                                        | TextureFormat::D32Float => vk::ImageAspectFlags::DEPTH,
-                                        _ => vk::ImageAspectFlags::COLOR,
-                                    },
+                                    aspect_mask: self.format.to_vk_aspect_flags(),
                                     base_array_layer: view_desc.base_layer as u32,
                                     base_mip_level: view_desc.base_mip,
                                     layer_count: view_desc.layer_count as u32,
@@ -1296,7 +1730,7 @@ impl GPUBuffer {
     pub fn gpu(&self) -> vk::DeviceAddress {
         self.gpu_pointer
     }
-    pub fn upload<T: bytemuck::Pod>(&mut self, slice: &[T]) {
+    pub fn upload<T: bytemuck::Pod>(&mut self, offset: usize, slice: &[T]) {
         let bytes = bytemuck::cast_slice::<T, u8>(slice);
         let allocation = self.allocation.as_mut().unwrap();
         if bytes.len() > allocation.size() as usize {
@@ -1304,7 +1738,7 @@ impl GPUBuffer {
         }
         let cpu_data = &mut allocation
             .mapped_slice_mut()
-            .expect("buffer not mapped on cpu")[..bytes.len()];
+            .expect("buffer not mapped on cpu")[offset..(offset + bytes.len())];
         cpu_data.copy_from_slice(bytes);
     }
 }
@@ -1412,11 +1846,13 @@ impl Drop for GPUShader {
     }
 }
 pub struct GPUSwapchain {
-    swapchain: vk::SwapchainKHR,
     textures: Vec<Arc<GPUTexture>>,
     gpu: Weak<GPU>,
     present_semaphores: Vec<GPUSemaphore>,
+    swapchain: vk::SwapchainKHR,
     next_swap_image: u32,
+    display_handle: RawDisplayHandle,
+    window_handle: RawWindowHandle,
 }
 impl GPUSwapchain {
     pub fn acquire_next(&mut self) -> Arc<GPUTexture> {
@@ -1509,6 +1945,10 @@ impl GPUSwapchain {
             }
         }
     }
+    pub fn resize(&mut self) {
+        let gpu = self.gpu.upgrade().unwrap();
+        *self = gpu.create_swapchain(self.display_handle, self.window_handle);
+    }
 }
 pub enum SwapchainPresentResult {
     Ok,
@@ -1546,23 +1986,13 @@ impl QueueKind {
         true
     }
 }
+#[derive(Clone, Copy)]
 pub enum MemoryKind {
     Default,
     GPU,
     Readback,
 }
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct GraphicsShaderPushConstants {
-    vertex_data: vk::DeviceAddress,
-    fragment_data: vk::DeviceAddress,
-    indirect_data: vk::DeviceAddress,
-}
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct ComputeShaderPushConstants {
-    compute_data: vk::DeviceAddress,
-}
+
 fn to_vk_sample_count(sample_count: u32) -> vk::SampleCountFlags {
     match sample_count {
         1 => vk::SampleCountFlags::TYPE_1,
@@ -1574,4 +2004,283 @@ fn to_vk_sample_count(sample_count: u32) -> vk::SampleCountFlags {
         64 => vk::SampleCountFlags::TYPE_64,
         _ => panic!(),
     }
+}
+pub struct GPUArena {
+    gpu: Weak<GPU>,
+    memory: MemoryKind,
+    block_size: usize,
+    blocks: Vec<GPUBuffer>,
+    block_index: usize,
+    block_offset: usize,
+}
+impl GPUArena {
+    pub fn alloc<T: bytemuck::Pod>(&mut self, slice: &[T]) -> GPUPointer {
+        let layout = Layout::new::<T>().repeat(slice.len()).unwrap().0;
+        if layout.align() > 16 {
+            panic!("align must be at most 16");
+        }
+        if layout.size() > self.block_size {
+            panic!(
+                "cannot allocate objects bigger than block_size({})",
+                self.block_size
+            );
+        }
+        let next_addr_align = (self.block_offset + layout.align() - 1) & !(layout.align() - 1);
+        if next_addr_align + layout.size() > self.block_size {
+            let gpu = self.gpu.upgrade().unwrap();
+            self.blocks.push(gpu.allocate_buffer(
+                Layout::from_size_align(self.block_size, 16).unwrap(),
+                self.memory,
+            ));
+            self.block_index += 1;
+            let block = self.blocks.last_mut().unwrap();
+            block.upload(0, slice);
+            self.block_offset = layout.size();
+            GPUPointer {
+                buffer: block.buffer,
+                offset: 0,
+                pointer: block.gpu(),
+            }
+        } else {
+            let block = &mut self.blocks[self.block_index];
+            block.upload(next_addr_align, slice);
+            self.block_offset = next_addr_align + layout.size();
+            GPUPointer {
+                buffer: block.buffer,
+                offset: next_addr_align as u64,
+                pointer: block.gpu() + next_addr_align as u64,
+            }
+        }
+    }
+    pub fn clear(&mut self) {
+        self.block_index = 0;
+        self.block_offset = 0;
+    }
+}
+pub struct GraphicsShaders {
+    pub vertex: GPUShader,
+    pub fragment: GPUShader,
+}
+pub struct GPUDescriptorHeap {
+    gpu: Weak<GPU>,
+    pool: vk::DescriptorPool,
+    textures: vk::DescriptorSet,
+    textures_rw: vk::DescriptorSet,
+    samplers: vk::DescriptorSet,
+    sampler_cache: HashMap<TextureSampler, vk::Sampler>,
+}
+impl GPUDescriptorHeap {
+    pub fn set_textures(&mut self, offset: usize, textures: &[(&GPUTexture, TextureViewDesc)]) {
+        let gpu = self.gpu.upgrade().unwrap();
+        let mut infos = Vec::new();
+        for (texture, view) in textures {
+            infos.push(
+                vk::DescriptorImageInfo::default()
+                    .image_view(texture.get_view(view))
+                    .image_layout(vk::ImageLayout::GENERAL),
+            );
+        }
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.textures)
+            .dst_binding(0)
+            .dst_array_element(offset as u32)
+            .image_info(&infos)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE);
+        unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
+    }
+    pub fn set_textures_rw(&mut self, offset: usize, textures: &[(&GPUTexture, TextureViewDesc)]) {
+        let gpu = self.gpu.upgrade().unwrap();
+        let mut infos = Vec::new();
+        for (texture, view) in textures {
+            infos.push(
+                vk::DescriptorImageInfo::default()
+                    .image_view(texture.get_view(view))
+                    .image_layout(vk::ImageLayout::GENERAL),
+            );
+        }
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.textures_rw)
+            .dst_binding(0)
+            .dst_array_element(offset as u32)
+            .image_info(&infos)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE);
+        unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
+    }
+    pub fn set_samplers(&mut self, offset: usize, samplers: &[TextureSampler]) {
+        let gpu = self.gpu.upgrade().unwrap();
+        let mut infos = Vec::new();
+        for sampler in samplers {
+            infos.push(vk::DescriptorImageInfo::default().sampler(
+                *self.sampler_cache.entry(*sampler).or_insert_with(|| {
+                    let create_info = vk::SamplerCreateInfo::default()
+                        .address_mode_u(sampler.u.to_vk())
+                        .address_mode_v(sampler.v.to_vk())
+                        .address_mode_w(sampler.w.to_vk())
+                        .anisotropy_enable(sampler.max_anisotropy.is_some())
+                        .max_anisotropy(sampler.max_anisotropy.unwrap_or(0) as f32)
+                        .border_color(sampler.border.to_vk())
+                        .min_filter(sampler.min.to_vk())
+                        .mag_filter(sampler.mag.to_vk())
+                        .mipmap_mode(sampler.mip.to_vk_mip());
+                    unsafe { gpu.device.create_sampler(&create_info, None).unwrap() }
+                }),
+            ));
+        }
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.samplers)
+            .dst_binding(0)
+            .dst_array_element(offset as u32)
+            .image_info(&infos)
+            .descriptor_type(vk::DescriptorType::SAMPLER);
+        unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
+    }
+}
+impl Drop for GPUDescriptorHeap {
+    fn drop(&mut self) {
+        if let Some(gpu) = self.gpu.upgrade() {
+            unsafe {
+                gpu.device
+                    .free_descriptor_sets(
+                        self.pool,
+                        &[self.textures, self.textures_rw, self.samplers],
+                    )
+                    .unwrap();
+                gpu.device.destroy_descriptor_pool(self.pool, None);
+            };
+        }
+    }
+}
+#[derive(Hash, Clone, Copy, PartialEq, Eq)]
+pub struct TextureSampler {
+    min: SamplerFilter,
+    mag: SamplerFilter,
+    mip: SamplerFilter,
+    u: SamplerAddressMode,
+    v: SamplerAddressMode,
+    w: SamplerAddressMode,
+    max_anisotropy: Option<u8>, //should be float, but then not eq
+    border: SamplerBorder,
+}
+impl Default for TextureSampler {
+    fn default() -> Self {
+        TextureSampler {
+            min: SamplerFilter::Linear,
+            mag: SamplerFilter::Linear,
+            mip: SamplerFilter::Linear,
+            u: SamplerAddressMode::Repeat,
+            v: SamplerAddressMode::Repeat,
+            w: SamplerAddressMode::Repeat,
+            max_anisotropy: None,
+            border: SamplerBorder::FloatTransparentBlack,
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SamplerFilter {
+    Nearest,
+    Linear,
+}
+impl SamplerFilter {
+    fn to_vk(self) -> vk::Filter {
+        match self {
+            SamplerFilter::Linear => vk::Filter::LINEAR,
+            SamplerFilter::Nearest => vk::Filter::NEAREST,
+        }
+    }
+    fn to_vk_mip(self) -> vk::SamplerMipmapMode {
+        match self {
+            SamplerFilter::Nearest => vk::SamplerMipmapMode::NEAREST,
+            SamplerFilter::Linear => vk::SamplerMipmapMode::LINEAR,
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SamplerAddressMode {
+    Repeat,
+    MirrorRepeat,
+    Edge,
+    Border,
+}
+impl SamplerAddressMode {
+    fn to_vk(self) -> vk::SamplerAddressMode {
+        match self {
+            SamplerAddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
+            SamplerAddressMode::MirrorRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
+            SamplerAddressMode::Edge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            SamplerAddressMode::Border => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+        }
+    }
+}
+//todo: more
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SamplerBorder {
+    FloatTransparentBlack,
+    IntTransparentBlack,
+}
+impl SamplerBorder {
+    fn to_vk(self) -> vk::BorderColor {
+        match self {
+            SamplerBorder::FloatTransparentBlack => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            SamplerBorder::IntTransparentBlack => vk::BorderColor::INT_TRANSPARENT_BLACK,
+        }
+    }
+}
+struct GPUSettings {
+    desc_heap_max_textures: usize,
+    desc_heap_max_samplers: usize,
+    max_push_constant_size: usize,
+}
+impl Default for GPUSettings {
+    fn default() -> Self {
+        GPUSettings {
+            desc_heap_max_textures: 32768,
+            desc_heap_max_samplers: 32,
+            max_push_constant_size: 128,
+        }
+    }
+}
+struct TextureRegion {
+    offset: [i32; 3],
+    size: [u32; 3],
+    mip_level: u32,
+    base_layer: u32,
+    layer_count: u32,
+}
+impl Default for TextureRegion {
+    fn default() -> Self {
+        TextureRegion {
+            offset: [0; 3],
+            size: [0; 3],
+            mip_level: 0,
+            base_layer: 0,
+            layer_count: 1,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub struct GPUPointer {
+    buffer: vk::Buffer,
+    offset: u64,
+    pointer: u64,
+}
+impl GPUPointer {
+    pub fn gpu(self) -> u64 {
+        self.pointer
+    }
+}
+impl Into<GPUPointer> for &GPUBuffer {
+    fn into(self) -> GPUPointer {
+        GPUPointer {
+            buffer: self.buffer,
+            offset: self.allocation.as_ref().unwrap().offset(),
+            pointer: self.gpu_pointer,
+        }
+    }
+}
+pub mod TextureUsage {
+    pub const SAMPLED: u8 = 1;
+    pub const STORAGE: u8 = 2;
+    pub const TRANSFER_SRC: u8 = 4;
+    pub const COLOR_ATTACHMENT: u8 = 8;
+    pub const DEPTH_STENCIL_ATTACHMENT: u8 = 16;
 }
