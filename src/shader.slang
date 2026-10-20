@@ -45,7 +45,7 @@ VertexOutput vertexMain(uint vert_id : SV_VertexID)
     VertexOutput vert_out;
     //vert_out.pos = float4(float(vert_id%2), float(vert_id/2), 0.0, 1.0);
     //vert_out.color = float4(float3(float(vert_id)/4.), 1.0);
-    vert_out.pos = float4(vertex.pos + float3(0., 0.*DRAW_DATA.time%1., 0.), 1.);
+    vert_out.pos = float4(vertex.pos + float3(0., DRAW_DATA.time%1., 0.), 1.);
     //vert_out.color = float4(vertex.color, 1.);
     vert_out.uv = float2(float(vert_id%2), float(vert_id/2));
     return vert_out;

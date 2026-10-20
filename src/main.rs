@@ -2,9 +2,9 @@ use std::{
     alloc::Layout,
     cell::RefCell,
     collections::{BinaryHeap, HashMap, HashSet},
-    ffi::{CStr, CString},
+    ffi::CString,
     marker::PhantomData,
-    ops::{Add, Rem, Sub},
+    ops::{Rem, Sub},
     sync::{Arc, Mutex, Weak},
     time::Instant,
 };
@@ -26,11 +26,8 @@ use thread_local::ThreadLocal;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    raw_window_handle::{
-        DisplayHandle, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
-        WindowHandle,
-    },
+    event_loop::{ActiveEventLoop, EventLoop},
+    raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle},
     window::WindowId,
 };
 
@@ -73,22 +70,17 @@ impl ApplicationHandler for App {
         let window = event_loop
             .create_window(winit::window::Window::default_attributes())
             .unwrap();
-        let mut enabled_extensions =
-            ash_window::enumerate_required_extensions(window.display_handle().unwrap().as_raw())
-                .unwrap()
-                .to_vec();
-        println!(
-            "here: {:?}",
-            enabled_extensions
-                .into_iter()
-                .map(|ptr| unsafe { CStr::from_ptr(ptr).to_str().unwrap() })
-                .collect::<Vec<_>>()
-        );
-        let gpu = GPU::init(Default::default()).unwrap();
+        let gpu = GPU::init(GPUSettings {
+            instance_extensions: GPUSettings::get_required_extensions(
+                window.display_handle().unwrap(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
         let semaphore = gpu.create_semaphore(0);
         let swapchain = gpu.create_swapchain(
-            window.display_handle().unwrap().as_raw(),
-            window.window_handle().unwrap().as_raw(),
+            window.display_handle().unwrap(),
+            window.window_handle().unwrap(),
         );
         let shader = include_bytes!("shader.spv");
         let shaders = gpu
@@ -102,14 +94,14 @@ impl ApplicationHandler for App {
                 ..Default::default()
             }],
         );
-        let mut upload_semaphore = gpu.create_semaphore(0);
+        let upload_semaphore = gpu.create_semaphore(0);
         let image = image::open("image.png").unwrap().into_rgba8();
-        let mut image_buffer = image
+        let image_buffer = image
             .pixels()
             .map(|rgba| rgba.0.into_iter())
             .flatten()
             .collect::<Vec<_>>();
-        let mut texture = gpu.create_texture(
+        let texture = gpu.create_texture(
             TextureDesc {
                 dimensions: [image.width(), image.height(), 1],
                 usage: TextureUsage::SAMPLED,
@@ -145,7 +137,7 @@ impl ApplicationHandler for App {
         });
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
@@ -178,7 +170,7 @@ impl ApplicationHandler for App {
 
                 let mut commands = data.gpu.begin_commands(QueueKind::Main);
                 commands.bind_descriptor_heap(&data.desc_heap);
-                let target = data.swapchain.acquire_next();
+                let target = data.swapchain.acquire_next().0;
                 {
                     let mut render_pass = commands.begin_render(RenderPassDesc {
                         color_attachments: &[RenderPassAttachment {
@@ -199,6 +191,7 @@ impl ApplicationHandler for App {
                         },
                         3,
                         1,
+                        None,
                         Default::default(),
                     );
                 }
@@ -209,9 +202,9 @@ impl ApplicationHandler for App {
                     .swapchain
                     .present(QueueKind::Main, &data.semaphore, data.next_frame)
                 {
-                    SwapchainPresentResult::Ok => {}
-                    SwapchainPresentResult::Suboptimal => {
-                        data.swapchain.resize();
+                    SwapchainResult::Ok => {}
+                    SwapchainResult::Suboptimal => {
+                        data.swapchain.recreate();
                     }
                 }
 
@@ -220,7 +213,7 @@ impl ApplicationHandler for App {
 
                 data.window.request_redraw();
             }
-            WindowEvent::Resized(new_size) => {}
+            WindowEvent::Resized(_) => {}
             _ => (),
         }
     }
@@ -262,16 +255,15 @@ impl GPU {
                 api_version: vk::API_VERSION_1_3,
                 ..Default::default()
             };
-            let mut enabled_extension_instance_names = vec![];
-            enabled_extension_instance_names.push(ash::khr::surface::NAME.as_ptr());
-            enabled_extension_instance_names.push(ash::khr::xlib_surface::NAME.as_ptr());
             let mut enabled_layer_names = Vec::new();
-            enabled_layer_names.push("VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8);
+            if settings.validate {
+                enabled_layer_names.push("VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8);
+            }
             let create_info = vk::InstanceCreateInfo {
                 p_application_info: &app_info,
                 ..Default::default()
             }
-            .enabled_extension_names(&enabled_extension_instance_names)
+            .enabled_extension_names(&settings.instance_extensions)
             .enabled_layer_names(&enabled_layer_names);
             let instance = entry.create_instance(&create_info, None)?;
 
@@ -483,35 +475,31 @@ impl GPU {
                 }
             }
 
-            let common_pipeline_graphics_layout = unsafe {
-                device
-                    .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&descriptor_layouts)
-                            .push_constant_ranges(&[vk::PushConstantRange {
-                                offset: 0,
-                                size: settings.max_push_constant_size as u32,
-                                stage_flags: vk::ShaderStageFlags::VERTEX
-                                    | vk::ShaderStageFlags::FRAGMENT,
-                            }]),
-                        None,
-                    )
-                    .unwrap()
-            };
-            let common_pipeline_compute_layout = unsafe {
-                device
-                    .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&descriptor_layouts)
-                            .push_constant_ranges(&[vk::PushConstantRange {
-                                offset: 0,
-                                size: settings.max_push_constant_size as u32,
-                                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                            }]),
-                        None,
-                    )
-                    .unwrap()
-            };
+            let common_pipeline_graphics_layout = device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&descriptor_layouts)
+                        .push_constant_ranges(&[vk::PushConstantRange {
+                            offset: 0,
+                            size: settings.max_push_constant_size as u32,
+                            stage_flags: vk::ShaderStageFlags::VERTEX
+                                | vk::ShaderStageFlags::FRAGMENT,
+                        }]),
+                    None,
+                )
+                .unwrap();
+            let common_pipeline_compute_layout = device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&descriptor_layouts)
+                        .push_constant_ranges(&[vk::PushConstantRange {
+                            offset: 0,
+                            size: settings.max_push_constant_size as u32,
+                            stage_flags: vk::ShaderStageFlags::COMPUTE,
+                        }]),
+                    None,
+                )
+                .unwrap();
 
             Ok(Arc::new_cyclic(move |weak| GPU {
                 shader_object_device,
@@ -536,6 +524,14 @@ impl GPU {
                 settings,
             }))
         }
+    }
+    pub fn queue_wait_idle(&self, queue: QueueKind) {
+        let _lock = self.command_buffer_counters.lock().unwrap();
+        unsafe {
+            self.device
+                .queue_wait_idle(self.queues[queue as usize])
+                .unwrap()
+        };
     }
     pub fn allocate_buffer(&self, layout: Layout, memory: MemoryKind) -> GPUBuffer {
         let location = match memory {
@@ -611,13 +607,13 @@ impl GPU {
             vertex: self.create_shader_spirv(
                 code,
                 entry_point_vertex,
-                GPUShaderKind::Vertex,
+                ShaderKind::Vertex,
                 specializations,
             )?,
             fragment: self.create_shader_spirv(
                 code,
                 entry_point_fragment,
-                GPUShaderKind::Fragment,
+                ShaderKind::Fragment,
                 specializations,
             )?,
         })
@@ -626,7 +622,7 @@ impl GPU {
         &self,
         code: &[u8],
         entry_point: &str,
-        kind: GPUShaderKind,
+        kind: ShaderKind,
         specializations: &HashMap<u32, u32>,
     ) -> VkResult<GPUShader> {
         let mut aligned_code = vec![0u32; code.len().div_ceil(4)];
@@ -634,23 +630,21 @@ impl GPU {
             &mut bytemuck::cast_slice_mut::<_, u8>(aligned_code.as_mut_slice())[..code.len()];
         aligned_code.copy_from_slice(code);
         let (stage, next_stage) = match kind {
-            GPUShaderKind::Vertex => (vk::ShaderStageFlags::VERTEX, vk::ShaderStageFlags::FRAGMENT),
-            GPUShaderKind::Fragment => (
+            ShaderKind::Vertex => (vk::ShaderStageFlags::VERTEX, vk::ShaderStageFlags::FRAGMENT),
+            ShaderKind::Fragment => (
                 vk::ShaderStageFlags::FRAGMENT,
                 vk::ShaderStageFlags::empty(),
             ),
-            GPUShaderKind::Compute { workgroup_size } => {
-                (vk::ShaderStageFlags::COMPUTE, vk::ShaderStageFlags::empty())
-            }
+            ShaderKind::Compute => (vk::ShaderStageFlags::COMPUTE, vk::ShaderStageFlags::empty()),
         };
         let mut push_constants = Vec::new();
         push_constants.push(match kind {
-            GPUShaderKind::Vertex | GPUShaderKind::Fragment => vk::PushConstantRange {
+            ShaderKind::Vertex | ShaderKind::Fragment => vk::PushConstantRange {
                 offset: 0,
                 size: self.settings.max_push_constant_size as u32,
                 stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             },
-            GPUShaderKind::Compute { .. } => vk::PushConstantRange {
+            ShaderKind::Compute { .. } => vk::PushConstantRange {
                 offset: 0,
                 size: self.settings.max_push_constant_size as u32,
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
@@ -667,7 +661,7 @@ impl GPU {
             });
             specialization_data.push(*data);
         }
-        let mut specialization_info = vk::SpecializationInfo::default()
+        let specialization_info = vk::SpecializationInfo::default()
             .map_entries(&specialization_map)
             .data(bytemuck::cast_slice(&specialization_data));
         let cstr_name = CString::new(entry_point).unwrap();
@@ -718,7 +712,8 @@ impl GPU {
                 let pooled = local.pools[queue as usize].pop().unwrap();
                 unsafe {
                     self.device
-                        .begin_command_buffer(pooled.command_buffer, &command_begin_info);
+                        .begin_command_buffer(pooled.command_buffer, &command_begin_info)
+                        .unwrap();
                 }
                 return GPUCommandBuffer {
                     command_buffer: pooled.command_buffer,
@@ -728,6 +723,7 @@ impl GPU {
                     waiting: Vec::new(),
                     submitted: false,
                     _marker: PhantomData,
+                    has_compute_shader: false,
                 };
             }
         }
@@ -742,7 +738,8 @@ impl GPU {
         .unwrap()[0];
         unsafe {
             self.device
-                .begin_command_buffer(command_buffer, &command_begin_info);
+                .begin_command_buffer(command_buffer, &command_begin_info)
+                .unwrap();
         }
         GPUCommandBuffer {
             command_buffer,
@@ -752,6 +749,7 @@ impl GPU {
             waiting: Vec::new(),
             submitted: false,
             _marker: PhantomData,
+            has_compute_shader: false,
         }
     }
     pub fn create_texture(
@@ -762,19 +760,19 @@ impl GPU {
         wait_value: u64,
     ) -> GPUTexture {
         let mut usage = vk::ImageUsageFlags::TRANSFER_DST;
-        if desc.usage & TextureUsage::TRANSFER_SRC != 0 {
+        if desc.usage.0 & TextureUsage::TRANSFER_SRC.0 != 0 {
             usage |= vk::ImageUsageFlags::TRANSFER_SRC;
         }
-        if desc.usage & TextureUsage::SAMPLED != 0 {
+        if desc.usage.0 & TextureUsage::SAMPLED.0 != 0 {
             usage |= vk::ImageUsageFlags::SAMPLED;
         }
-        if desc.usage & TextureUsage::STORAGE != 0 {
+        if desc.usage.0 & TextureUsage::STORAGE.0 != 0 {
             usage |= vk::ImageUsageFlags::STORAGE;
         }
-        if desc.usage & TextureUsage::COLOR_ATTACHMENT != 0 {
+        if desc.usage.0 & TextureUsage::COLOR_ATTACHMENT.0 != 0 {
             usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
         }
-        if desc.usage & TextureUsage::DEPTH_STENCIL_ATTACHMENT != 0 {
+        if desc.usage.0 & TextureUsage::DEPTH_STENCIL_ATTACHMENT.0 != 0 {
             usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
         }
         let image = unsafe {
@@ -864,99 +862,25 @@ impl GPU {
             allocation: Some(allocation),
             view_cache: Default::default(),
             gpu: self.weak.clone(),
+            is_swapchain: false,
         }
     }
     pub fn create_swapchain(
         &self,
-        display_handle: RawDisplayHandle,
-        window_handle: RawWindowHandle,
+        display_handle: DisplayHandle,
+        window_handle: WindowHandle,
     ) -> GPUSwapchain {
         unsafe {
             let surface = ash_window::create_surface(
                 &self.entry,
                 &self.instance,
-                display_handle,
-                window_handle,
+                display_handle.as_raw(),
+                window_handle.as_raw(),
                 None,
             )
             .unwrap();
-            let surface_format = self
-                .surface_loader
-                .get_physical_device_surface_formats(self.physical_device, surface)
-                .unwrap()[0];
-            let surface_capabilities = self
-                .surface_loader
-                .get_physical_device_surface_capabilities(self.physical_device, surface)
-                .unwrap();
-            let mut desired_image_count = surface_capabilities.min_image_count + 1;
-            if surface_capabilities.max_image_count > 0
-                && desired_image_count > surface_capabilities.max_image_count
-            {
-                desired_image_count = surface_capabilities.max_image_count;
-            }
-            let surface_resolution = match surface_capabilities.current_extent.width {
-                u32::MAX => vk::Extent2D {
-                    width: 400,
-                    height: 400,
-                },
-                _ => surface_capabilities.current_extent,
-            };
-            let pre_transform = if surface_capabilities
-                .supported_transforms
-                .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
-            {
-                vk::SurfaceTransformFlagsKHR::IDENTITY
-            } else {
-                surface_capabilities.current_transform
-            };
-            let present_modes = self
-                .surface_loader
-                .get_physical_device_surface_present_modes(self.physical_device, surface)
-                .unwrap();
-            /*let present_mode = present_modes
-            .iter()
-            .cloned()
-            .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
-            .unwrap_or(vk::PresentModeKHR::FIFO);*/
-            let present_mode = vk::PresentModeKHR::FIFO;
-            let info = vk::SwapchainCreateInfoKHR::default()
-                .min_image_count(desired_image_count)
-                .image_color_space(surface_format.color_space)
-                .image_format(surface_format.format)
-                .image_extent(surface_resolution)
-                .pre_transform(pre_transform)
-                .surface(surface)
-                .present_mode(present_mode)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .clipped(true)
-                .image_array_layers(1)
-                .image_sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let swapchain = unsafe { self.swapchain_device.create_swapchain(&info, None).unwrap() };
-            let images = self
-                .swapchain_device
-                .get_swapchain_images(swapchain)
-                .unwrap();
-            let textures: Vec<Arc<GPUTexture>> = images
-                .into_iter()
-                .map(|image| {
-                    Arc::new(GPUTexture {
-                        image,
-                        dimensions: [surface_resolution.width, surface_resolution.height, 1],
-                        format: match surface_format.format {
-                            vk::Format::B8G8R8A8_SRGB => TextureFormat::BGRA8SRGB,
-                            format => unimplemented!("{:?}", format),
-                        },
-                        layer_count: 1,
-                        sample_count: 1,
-                        mip_count: 1,
-                        allocation: None,
-                        view_cache: Default::default(),
-                        gpu: self.weak.clone(),
-                        texture_type: TextureType::D2,
-                    })
-                })
-                .collect();
+            let mut textures = Vec::new();
+            let swapchain = GPUSwapchain::make_swapchain(self, surface, &mut textures);
             GPUSwapchain {
                 present_semaphores: std::iter::repeat_with(|| {
                     GPUSemaphore::create_binary(&self.device, &self.weak)
@@ -967,8 +891,7 @@ impl GPU {
                 textures,
                 next_swap_image: 0,
                 gpu: self.weak.clone(),
-                display_handle,
-                window_handle,
+                surface,
             }
         }
     }
@@ -1033,7 +956,7 @@ pub struct TextureDesc {
     pub mip_count: u32,
     pub layer_count: u32,
     pub sample_count: u32,
-    pub usage: u8,
+    pub usage: TextureUsage,
 }
 impl Default for TextureDesc {
     fn default() -> Self {
@@ -1044,7 +967,7 @@ impl Default for TextureDesc {
             mip_count: 1,
             layer_count: 1,
             sample_count: 1,
-            usage: 0,
+            usage: TextureUsage::EMPTY,
         }
     }
 }
@@ -1088,6 +1011,7 @@ pub struct GPUCommandBuffer {
     signalling: Vec<(vk::Semaphore, u64)>,
     _marker: PhantomData<*mut ()>, //not send
     submitted: bool,
+    has_compute_shader: bool,
 }
 impl GPUCommandBuffer {
     pub fn add_wait(&mut self, semaphore: &GPUSemaphore, value: u64) {
@@ -1254,6 +1178,53 @@ impl GPUCommandBuffer {
         }
         GPURenderPass {
             command_buffer: self,
+            has_shaders_bound: false,
+        }
+    }
+    pub fn set_compute_shader(&mut self, shader: &GPUShader) {
+        let gpu = self.gpu.upgrade().unwrap();
+        match shader.kind {
+            ShaderKind::Compute => {}
+            _ => panic!("wrong type of shader bound"),
+        }
+        unsafe {
+            gpu.shader_object_device.cmd_bind_shaders(
+                self.command_buffer,
+                &[vk::ShaderStageFlags::COMPUTE],
+                &[shader.shader],
+            );
+        }
+        self.has_compute_shader = true;
+    }
+    pub fn dispatch<D: bytemuck::Pod>(&mut self, data: D, groups: [u32; 3]) {
+        let gpu = self.gpu.upgrade().unwrap();
+        assert!(
+            std::mem::size_of::<D>() <= gpu.settings.max_push_constant_size,
+            "compute data size greater than set size"
+        );
+        assert!(self.has_compute_shader);
+        unsafe {
+            gpu.device.cmd_push_constants(
+                self.command_buffer,
+                gpu.common_pipeline_compute_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&data),
+            );
+            gpu.device
+                .cmd_dispatch(self.command_buffer, groups[0], groups[1], groups[2]);
+        }
+    }
+    pub fn copy(&mut self, src: GPUPointer, dst: GPUPointer) {
+        assert_eq!(src.size, dst.size);
+        let gpu = self.gpu.upgrade().unwrap();
+        let copy = vk::BufferCopy::default()
+            .src_offset(src.offset)
+            .dst_offset(dst.offset)
+            .size(src.size);
+        unsafe {
+            gpu.device
+                .cmd_copy_buffer(self.command_buffer, src.buffer, dst.buffer, &[copy]);
         }
     }
     pub fn copy_to_texture(
@@ -1402,10 +1373,16 @@ impl Drop for GPUCommandBuffer {
 }
 pub struct GPURenderPass<'a> {
     command_buffer: &'a mut GPUCommandBuffer,
+    has_shaders_bound: bool,
 }
 impl GPURenderPass<'_> {
     pub fn set_shaders_individual(&mut self, vertex: &GPUShader, fragment: &GPUShader) {
+        match (vertex.kind, fragment.kind) {
+            (ShaderKind::Vertex, ShaderKind::Fragment) => {}
+            _ => panic!("wrong type of shader bound"),
+        }
         let gpu = self.command_buffer.gpu.upgrade().unwrap();
+        self.has_shaders_bound = true;
         unsafe {
             gpu.shader_object_device.cmd_bind_shaders(
                 self.command_buffer.command_buffer,
@@ -1420,8 +1397,9 @@ impl GPURenderPass<'_> {
     pub fn draw<D: bytemuck::Pod>(
         &mut self,
         draw_data: D,
-        vertex_count: u32,
+        count: u32,
         instance_count: u32,
+        index_buffer: Option<(GPUPointer, IndexBufferFormat)>,
         draw_options: DrawOptions,
     ) {
         let gpu = self.command_buffer.gpu.upgrade().unwrap();
@@ -1429,6 +1407,7 @@ impl GPURenderPass<'_> {
             std::mem::size_of::<D>() <= gpu.settings.max_push_constant_size,
             "draw data size greater than set size"
         );
+        assert!(self.has_shaders_bound);
         unsafe {
             gpu.device.cmd_push_constants(
                 self.command_buffer.command_buffer,
@@ -1437,13 +1416,36 @@ impl GPURenderPass<'_> {
                 0,
                 bytemuck::bytes_of(&draw_data),
             );
-            gpu.device.cmd_draw(
-                self.command_buffer.command_buffer,
-                vertex_count,
-                instance_count,
-                0,
-                0,
-            );
+            match index_buffer {
+                Some((index_buffer, index_format)) => {
+                    gpu.device.cmd_bind_index_buffer(
+                        self.command_buffer.command_buffer,
+                        index_buffer.buffer,
+                        index_buffer.offset,
+                        match index_format {
+                            IndexBufferFormat::U16 => vk::IndexType::UINT16,
+                            IndexBufferFormat::U32 => vk::IndexType::UINT32,
+                        },
+                    );
+                    gpu.device.cmd_draw_indexed(
+                        self.command_buffer.command_buffer,
+                        count,
+                        instance_count,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                None => {
+                    gpu.device.cmd_draw(
+                        self.command_buffer.command_buffer,
+                        count,
+                        instance_count,
+                        0,
+                        0,
+                    );
+                }
+            }
         }
     }
 }
@@ -1463,13 +1465,13 @@ impl Default for DrawOptions {
     }
 }
 pub struct RenderPassDesc<'a> {
-    render_area_offset: [i32; 2],
-    render_area_size: [u32; 2],
-    layer_count: u32,
-    view_mask: u32,
-    color_attachments: &'a [RenderPassAttachment<'a, [f32; 4]>],
-    depth_attachment: Option<RenderPassAttachment<'a, f32>>,
-    stencil_attachment: Option<RenderPassAttachment<'a, u32>>,
+    pub render_area_offset: [i32; 2],
+    pub render_area_size: [u32; 2],
+    pub layer_count: u32,
+    pub view_mask: u32,
+    pub color_attachments: &'a [RenderPassAttachment<'a, [f32; 4]>],
+    pub depth_attachment: Option<RenderPassAttachment<'a, f32>>,
+    pub stencil_attachment: Option<RenderPassAttachment<'a, u32>>,
 }
 impl Default for RenderPassDesc<'_> {
     fn default() -> Self {
@@ -1485,24 +1487,24 @@ impl Default for RenderPassDesc<'_> {
     }
 }
 pub struct RenderPassAttachment<'a, C> {
-    texture: &'a GPUTexture,
-    view: TextureViewDesc,
-    load: RenderPassLoadOp<C>,
-    store: RenderPassStoreOp,
-    resolve: Option<(&'a GPUTexture, TextureViewDesc)>,
+    pub texture: &'a GPUTexture,
+    pub view: TextureViewDesc,
+    pub load: RenderPassLoadOp<C>,
+    pub store: RenderPassStoreOp,
+    pub resolve: Option<(&'a GPUTexture, TextureViewDesc)>,
 }
 trait IntoClearValue: Copy {
     fn into_clear_value(self, format: TextureFormat) -> vk::ClearValue;
 }
 impl IntoClearValue for [f32; 4] {
-    fn into_clear_value(self, format: TextureFormat) -> vk::ClearValue {
+    fn into_clear_value(self, _format: TextureFormat) -> vk::ClearValue {
         vk::ClearValue {
             color: vk::ClearColorValue { float32: self },
         }
     }
 }
 impl IntoClearValue for f32 {
-    fn into_clear_value(self, format: TextureFormat) -> vk::ClearValue {
+    fn into_clear_value(self, _format: TextureFormat) -> vk::ClearValue {
         vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: self,
@@ -1512,7 +1514,7 @@ impl IntoClearValue for f32 {
     }
 }
 impl IntoClearValue for u32 {
-    fn into_clear_value(self, format: TextureFormat) -> vk::ClearValue {
+    fn into_clear_value(self, _format: TextureFormat) -> vk::ClearValue {
         vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: 0.,
@@ -1570,7 +1572,7 @@ impl TextureType {
     }
 }
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum TextureFormat {
+pub enum TextureFormat {
     R8Unorm,
     RG8Unorm,
     RGBA8Unorm,
@@ -1660,7 +1662,7 @@ impl TextureFormat {
         }
     }
 }
-struct GPUTexture {
+pub struct GPUTexture {
     texture_type: TextureType,
     dimensions: [u32; 3],
     format: TextureFormat,
@@ -1670,6 +1672,7 @@ struct GPUTexture {
     image: vk::Image,
     view_cache: Mutex<HashMap<TextureViewDesc, vk::ImageView>>,
     allocation: Option<Allocation>,
+    is_swapchain: bool,
     gpu: Weak<GPU>,
 }
 impl GPUTexture {
@@ -1709,13 +1712,18 @@ impl GPUTexture {
 impl Drop for GPUTexture {
     fn drop(&mut self) {
         if let Some(gpu) = self.gpu.upgrade() {
+            if let Some(allocation) = self.allocation.take() {
+                gpu.allocator.lock().unwrap().free(allocation).unwrap();
+            }
             for (_, view) in self.view_cache.get_mut().unwrap() {
                 unsafe {
                     gpu.device.destroy_image_view(*view, None);
                 }
             }
-            unsafe {
-                gpu.device.destroy_image(self.image, None);
+            if !self.is_swapchain {
+                unsafe {
+                    gpu.device.destroy_image(self.image, None);
+                }
             }
         }
     }
@@ -1827,14 +1835,14 @@ impl Drop for GPUSemaphore {
 }
 pub struct GPUShader {
     shader: vk::ShaderEXT,
-    kind: GPUShaderKind,
+    kind: ShaderKind,
     gpu: Weak<GPU>,
 }
 #[derive(Clone, Copy)]
-pub enum GPUShaderKind {
+pub enum ShaderKind {
     Vertex,
     Fragment,
-    Compute { workgroup_size: [f32; 3] },
+    Compute,
 }
 impl Drop for GPUShader {
     fn drop(&mut self) {
@@ -1851,11 +1859,96 @@ pub struct GPUSwapchain {
     present_semaphores: Vec<GPUSemaphore>,
     swapchain: vk::SwapchainKHR,
     next_swap_image: u32,
-    display_handle: RawDisplayHandle,
-    window_handle: RawWindowHandle,
+    surface: vk::SurfaceKHR,
 }
 impl GPUSwapchain {
-    pub fn acquire_next(&mut self) -> Arc<GPUTexture> {
+    fn make_swapchain(
+        gpu: &GPU,
+        surface: vk::SurfaceKHR,
+        textures: &mut Vec<Arc<GPUTexture>>,
+    ) -> vk::SwapchainKHR {
+        let surface_format: vk::SurfaceFormatKHR = unsafe {
+            gpu.surface_loader
+                .get_physical_device_surface_formats(gpu.physical_device, surface)
+                .unwrap()
+        }[0];
+        let surface_capabilities = unsafe {
+            gpu.surface_loader
+                .get_physical_device_surface_capabilities(gpu.physical_device, surface)
+                .unwrap()
+        };
+        let mut desired_image_count = surface_capabilities.min_image_count + 1;
+        if surface_capabilities.max_image_count > 0
+            && desired_image_count > surface_capabilities.max_image_count
+        {
+            desired_image_count = surface_capabilities.max_image_count;
+        }
+        let surface_resolution = match surface_capabilities.current_extent.width {
+            u32::MAX => vk::Extent2D {
+                width: 256,
+                height: 256,
+            },
+            _ => surface_capabilities.current_extent,
+        };
+        let pre_transform = if surface_capabilities
+            .supported_transforms
+            .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
+        {
+            vk::SurfaceTransformFlagsKHR::IDENTITY
+        } else {
+            surface_capabilities.current_transform
+        };
+        let _present_modes = unsafe {
+            gpu.surface_loader
+                .get_physical_device_surface_present_modes(gpu.physical_device, surface)
+                .unwrap()
+        };
+        /*let present_mode = present_modes
+        .iter()
+        .cloned()
+        .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
+        .unwrap_or(vk::PresentModeKHR::FIFO);*/
+        let present_mode = vk::PresentModeKHR::FIFO;
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .min_image_count(desired_image_count)
+            .image_color_space(surface_format.color_space)
+            .image_format(surface_format.format)
+            .image_extent(surface_resolution)
+            .pre_transform(pre_transform)
+            .surface(surface)
+            .present_mode(present_mode)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .clipped(true)
+            .image_array_layers(1)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let swapchain = unsafe { gpu.swapchain_device.create_swapchain(&info, None).unwrap() };
+        let images = unsafe {
+            gpu.swapchain_device
+                .get_swapchain_images(swapchain)
+                .unwrap()
+        };
+        textures.extend(images.into_iter().map(|image| {
+            Arc::new(GPUTexture {
+                image,
+                dimensions: [surface_resolution.width, surface_resolution.height, 1],
+                format: match surface_format.format {
+                    vk::Format::B8G8R8A8_SRGB => TextureFormat::BGRA8SRGB,
+                    format => unimplemented!("{:?}", format),
+                },
+                layer_count: 1,
+                sample_count: 1,
+                mip_count: 1,
+                allocation: None,
+                view_cache: Default::default(),
+                gpu: gpu.weak.clone(),
+                texture_type: TextureType::D2,
+                is_swapchain: true,
+            })
+        }));
+        swapchain
+    }
+    pub fn acquire_next(&mut self) -> (Arc<GPUTexture>, SwapchainResult) {
         unsafe {
             let gpu = self.gpu.upgrade().unwrap();
             let fence = gpu
@@ -1867,9 +1960,11 @@ impl GPUSwapchain {
                 .acquire_next_image(self.swapchain, u64::MAX, vk::Semaphore::null(), fence)
                 .unwrap();
             self.next_swap_image = index;
-            gpu.device.wait_for_fences(&[fence], true, u64::MAX);
+            gpu.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .unwrap();
             gpu.device.destroy_fence(fence, None);
-            let mut command_buffer = gpu.begin_commands(QueueKind::Main);
+            let command_buffer = gpu.begin_commands(QueueKind::Main);
             let image_barrier = vk::ImageMemoryBarrier2::default()
                 .image(self.textures[index as usize].image)
                 .subresource_range(vk::ImageSubresourceRange {
@@ -1890,7 +1985,14 @@ impl GPUSwapchain {
                 &vk::DependencyInfo::default().image_memory_barriers(&[image_barrier]),
             );
             command_buffer.submit();
-            self.textures[index as usize].clone()
+            (
+                self.textures[index as usize].clone(),
+                if suboptimal {
+                    SwapchainResult::Suboptimal
+                } else {
+                    SwapchainResult::Ok
+                },
+            )
         }
     }
     pub fn present(
@@ -1898,7 +2000,7 @@ impl GPUSwapchain {
         queue: QueueKind,
         wait_semaphore: &GPUSemaphore,
         wait_value: u64,
-    ) -> SwapchainPresentResult {
+    ) -> SwapchainResult {
         let gpu = self.gpu.upgrade().unwrap();
         let mut command_buffer = gpu.begin_commands(queue);
         let image_barrier = vk::ImageMemoryBarrier2::default()
@@ -1925,7 +2027,7 @@ impl GPUSwapchain {
         command_buffer.add_wait(wait_semaphore, wait_value);
         command_buffer.add_signal(&self.present_semaphores[self.next_swap_image as usize], 0);
         command_buffer.submit();
-        let queue_lock = gpu.command_buffer_counters.lock().unwrap();
+        let _queue_lock = gpu.command_buffer_counters.lock().unwrap();
         unsafe {
             let suboptimal = gpu
                 .swapchain_device
@@ -1940,17 +2042,27 @@ impl GPUSwapchain {
                 )
                 .unwrap();
             match suboptimal {
-                true => SwapchainPresentResult::Suboptimal,
-                false => SwapchainPresentResult::Ok,
+                true => SwapchainResult::Suboptimal,
+                false => SwapchainResult::Ok,
             }
         }
     }
-    pub fn resize(&mut self) {
+    pub fn recreate(&mut self) {
         let gpu = self.gpu.upgrade().unwrap();
-        *self = gpu.create_swapchain(self.display_handle, self.window_handle);
+        gpu.queue_wait_idle(QueueKind::Main);
+        self.textures.clear();
+        //todo: use old_swapchain
+        unsafe {
+            gpu.swapchain_device.destroy_swapchain(self.swapchain, None);
+        }
+        self.swapchain = GPUSwapchain::make_swapchain(&gpu, self.surface, &mut self.textures);
+        self.present_semaphores =
+            std::iter::repeat_with(|| GPUSemaphore::create_binary(&gpu.device, &gpu.weak))
+                .take(self.textures.len())
+                .collect();
     }
 }
-pub enum SwapchainPresentResult {
+pub enum SwapchainResult {
     Ok,
     Suboptimal,
 }
@@ -1959,6 +2071,9 @@ impl Drop for GPUSwapchain {
         if let Some(gpu) = self.gpu.upgrade() {
             unsafe {
                 gpu.swapchain_device.destroy_swapchain(self.swapchain, None);
+            }
+            unsafe {
+                gpu.surface_loader.destroy_surface(self.surface, None);
             }
         }
     }
@@ -2027,19 +2142,22 @@ impl GPUArena {
         }
         let next_addr_align = (self.block_offset + layout.align() - 1) & !(layout.align() - 1);
         if next_addr_align + layout.size() > self.block_size {
-            let gpu = self.gpu.upgrade().unwrap();
-            self.blocks.push(gpu.allocate_buffer(
-                Layout::from_size_align(self.block_size, 16).unwrap(),
-                self.memory,
-            ));
             self.block_index += 1;
-            let block = self.blocks.last_mut().unwrap();
+            if self.block_index >= self.blocks.len() {
+                let gpu = self.gpu.upgrade().unwrap();
+                self.blocks.push(gpu.allocate_buffer(
+                    Layout::from_size_align(self.block_size, 16).unwrap(),
+                    self.memory,
+                ));
+            }
+            let block = self.blocks.get_mut(self.block_index).unwrap();
             block.upload(0, slice);
             self.block_offset = layout.size();
             GPUPointer {
                 buffer: block.buffer,
                 offset: 0,
                 pointer: block.gpu(),
+                size: layout.size() as u64,
             }
         } else {
             let block = &mut self.blocks[self.block_index];
@@ -2049,9 +2167,11 @@ impl GPUArena {
                 buffer: block.buffer,
                 offset: next_addr_align as u64,
                 pointer: block.gpu() + next_addr_align as u64,
+                size: layout.size() as u64,
             }
         }
     }
+    //pub fn alloc_multi_split<T: bytemuck::Pod>(&mut self, slice: &[T]) -> Vec<(GPUPointer, usize)>{}
     pub fn clear(&mut self) {
         self.block_index = 0;
         self.block_offset = 0;
@@ -2225,10 +2345,19 @@ impl SamplerBorder {
         }
     }
 }
-struct GPUSettings {
-    desc_heap_max_textures: usize,
-    desc_heap_max_samplers: usize,
-    max_push_constant_size: usize,
+pub struct GPUSettings {
+    pub desc_heap_max_textures: usize,
+    pub desc_heap_max_samplers: usize,
+    pub max_push_constant_size: usize,
+    pub validate: bool,
+    pub instance_extensions: Vec<*const i8>,
+}
+impl GPUSettings {
+    fn get_required_extensions(display: DisplayHandle) -> Vec<*const i8> {
+        ash_window::enumerate_required_extensions(display.as_raw())
+            .unwrap()
+            .to_vec()
+    }
 }
 impl Default for GPUSettings {
     fn default() -> Self {
@@ -2236,15 +2365,17 @@ impl Default for GPUSettings {
             desc_heap_max_textures: 32768,
             desc_heap_max_samplers: 32,
             max_push_constant_size: 128,
+            validate: true,
+            instance_extensions: Vec::new(),
         }
     }
 }
-struct TextureRegion {
-    offset: [i32; 3],
-    size: [u32; 3],
-    mip_level: u32,
-    base_layer: u32,
-    layer_count: u32,
+pub struct TextureRegion {
+    pub offset: [i32; 3],
+    pub size: [u32; 3],
+    pub mip_level: u32,
+    pub base_layer: u32,
+    pub layer_count: u32,
 }
 impl Default for TextureRegion {
     fn default() -> Self {
@@ -2262,10 +2393,22 @@ pub struct GPUPointer {
     buffer: vk::Buffer,
     offset: u64,
     pointer: u64,
+    size: u64,
 }
 impl GPUPointer {
     pub fn gpu(self) -> u64 {
         self.pointer
+    }
+    pub fn slice(self, offset: u64, size: u64) -> GPUPointer {
+        if offset + size > self.size {
+            panic!("overflow")
+        };
+        GPUPointer {
+            buffer: self.buffer,
+            offset: self.offset + offset,
+            pointer: self.pointer + offset,
+            size,
+        }
     }
 }
 impl Into<GPUPointer> for &GPUBuffer {
@@ -2274,13 +2417,35 @@ impl Into<GPUPointer> for &GPUBuffer {
             buffer: self.buffer,
             offset: self.allocation.as_ref().unwrap().offset(),
             pointer: self.gpu_pointer,
+            size: self.allocation.as_ref().unwrap().size(),
         }
     }
 }
-pub mod TextureUsage {
-    pub const SAMPLED: u8 = 1;
-    pub const STORAGE: u8 = 2;
-    pub const TRANSFER_SRC: u8 = 4;
-    pub const COLOR_ATTACHMENT: u8 = 8;
-    pub const DEPTH_STENCIL_ATTACHMENT: u8 = 16;
+pub struct TextureUsage(u8);
+impl TextureUsage {
+    pub const EMPTY: TextureUsage = TextureUsage(0);
+    pub const SAMPLED: TextureUsage = TextureUsage(1);
+    pub const STORAGE: TextureUsage = TextureUsage(2);
+    pub const TRANSFER_SRC: TextureUsage = TextureUsage(4);
+    pub const COLOR_ATTACHMENT: TextureUsage = TextureUsage(8);
+    pub const DEPTH_STENCIL_ATTACHMENT: TextureUsage = TextureUsage(16);
+}
+impl std::ops::BitOr for TextureUsage {
+    type Output = TextureUsage;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        TextureUsage(self.0 | rhs.0)
+    }
+}
+#[derive(Clone, Copy)]
+pub enum IndexBufferFormat {
+    U16,
+    U32,
+}
+impl IndexBufferFormat {
+    pub fn size(self) -> usize {
+        match self {
+            IndexBufferFormat::U16 => 2,
+            IndexBufferFormat::U32 => 4,
+        }
+    }
 }
