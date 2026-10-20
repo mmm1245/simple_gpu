@@ -163,10 +163,15 @@ impl ApplicationHandler for App {
                         color: [0., mod_time, 0.],
                     },
                     Vertex {
-                        pos: [1., 1., 0.],
+                        pos: [0., 1., 0.],
                         color: [0., 0., mod_time],
                     },
+                    Vertex {
+                        pos: [1., 1., 0.],
+                        color: [0., 0., 0.],
+                    },
                 ]);
+                let indices = frame_arena.alloc::<u16>(&[0, 1, 2, 1, 3, 2]);
 
                 let mut commands = data.gpu.begin_commands(QueueKind::Main);
                 commands.bind_descriptor_heap(&data.desc_heap);
@@ -189,9 +194,9 @@ impl ApplicationHandler for App {
                             time,
                             _pad: 0,
                         },
-                        3,
+                        6,
                         1,
-                        None,
+                        Some((indices, IndexBufferFormat::U16)),
                         Default::default(),
                     );
                 }
@@ -237,9 +242,9 @@ pub struct GPU {
     surface_loader: ash::khr::surface::Instance,
     queues: [vk::Queue; 3],
     queue_families: [u32; 3],
-    command_buffer_semaphores: [GPUSemaphore; 3],
+    command_buffer_semaphores: [vk::Semaphore; 3],
     command_buffer_counters: Mutex<[u64; 3]>,
-    allocator: Mutex<Allocator>,
+    allocator: Option<Mutex<Allocator>>,
     thread_local: ThreadLocal<RefCell<GPUThreadLocalStorage>>,
     common_pipeline_graphics_layout: vk::PipelineLayout,
     common_pipeline_compute_layout: vk::PipelineLayout,
@@ -508,11 +513,22 @@ impl GPU {
                 queues,
                 physical_device,
                 queue_families,
-                allocator: Mutex::new(allocator),
+                allocator: Some(Mutex::new(allocator)),
                 thread_local: ThreadLocal::new(),
                 command_buffer_counters: Mutex::new([0; 3]),
                 command_buffer_semaphores: std::array::from_fn(|_| {
-                    GPUSemaphore::create_raw(&device, weak, 0)
+                    let mut semaphore_create_type_info = vk::SemaphoreTypeCreateInfo::default()
+                        .initial_value(0)
+                        .semaphore_type(vk::SemaphoreType::TIMELINE);
+                    unsafe {
+                        device
+                            .create_semaphore(
+                                &vk::SemaphoreCreateInfo::default()
+                                    .push_next(&mut semaphore_create_type_info),
+                                None,
+                            )
+                            .unwrap()
+                    }
                 }),
                 common_pipeline_graphics_layout,
                 common_pipeline_compute_layout,
@@ -559,6 +575,8 @@ impl GPU {
 
         let allocation = self
             .allocator
+            .as_ref()
+            .unwrap()
             .lock()
             .unwrap()
             .allocate(&AllocationCreateDesc {
@@ -584,7 +602,7 @@ impl GPU {
             allocation: Some(allocation),
             gpu_pointer,
             buffer,
-            gpu: self.weak.clone(),
+            gpu: self.weak.upgrade().unwrap(),
         }
     }
     pub fn allocate_buffer_with<T: bytemuck::Pod>(&self, data: &[T]) -> GPUBuffer {
@@ -594,7 +612,7 @@ impl GPU {
         buffer
     }
     pub fn create_semaphore(&self, value: u64) -> GPUSemaphore {
-        GPUSemaphore::create_raw(&self.device, &self.weak, value)
+        GPUSemaphore::create_raw(&self.device, self.weak.upgrade().unwrap(), value)
     }
     pub fn create_shaders_graphic_spirv(
         &self,
@@ -682,7 +700,7 @@ impl GPU {
         Ok(GPUShader {
             shader,
             kind,
-            gpu: self.weak.clone(),
+            gpu: self.weak.upgrade().unwrap(),
         })
     }
     pub fn begin_commands(&self, queue: QueueKind) -> GPUCommandBuffer {
@@ -706,7 +724,11 @@ impl GPU {
             .borrow_mut();
         let command_begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        let current_semaphore_value = self.command_buffer_semaphores[queue as usize].get_value();
+        let current_semaphore_value = unsafe {
+            self.device
+                .get_semaphore_counter_value(self.command_buffer_semaphores[queue as usize])
+                .unwrap()
+        };
         if let Some(pooled) = local.pools[queue as usize].peek() {
             if pooled.timestamp <= current_semaphore_value {
                 let pooled = local.pools[queue as usize].pop().unwrap();
@@ -718,7 +740,7 @@ impl GPU {
                 return GPUCommandBuffer {
                     command_buffer: pooled.command_buffer,
                     queue,
-                    gpu: self.weak.clone(),
+                    gpu: self.weak.upgrade().unwrap(),
                     signalling: Vec::new(),
                     waiting: Vec::new(),
                     submitted: false,
@@ -744,7 +766,7 @@ impl GPU {
         GPUCommandBuffer {
             command_buffer,
             queue,
-            gpu: self.weak.clone(),
+            gpu: self.weak.upgrade().unwrap(),
             signalling: Vec::new(),
             waiting: Vec::new(),
             submitted: false,
@@ -812,6 +834,8 @@ impl GPU {
         let image_requirements = unsafe { self.device.get_image_memory_requirements(image) };
         let allocation = self
             .allocator
+            .as_ref()
+            .unwrap()
             .lock()
             .unwrap()
             .allocate(&AllocationCreateDesc {
@@ -861,7 +885,7 @@ impl GPU {
             image,
             allocation: Some(allocation),
             view_cache: Default::default(),
-            gpu: self.weak.clone(),
+            gpu: self.weak.upgrade().unwrap(),
             is_swapchain: false,
         }
     }
@@ -883,14 +907,14 @@ impl GPU {
             let swapchain = GPUSwapchain::make_swapchain(self, surface, &mut textures);
             GPUSwapchain {
                 present_semaphores: std::iter::repeat_with(|| {
-                    GPUSemaphore::create_binary(&self.device, &self.weak)
+                    GPUSemaphore::create_binary(&self.device, self.weak.upgrade().unwrap())
                 })
                 .take(textures.len())
                 .collect(),
                 swapchain,
                 textures,
                 next_swap_image: 0,
-                gpu: self.weak.clone(),
+                gpu: self.weak.upgrade().unwrap(),
                 surface,
             }
         }
@@ -898,7 +922,7 @@ impl GPU {
     pub fn allocate_arena(&self, block_size: usize) -> GPUArena {
         let memory = MemoryKind::Default;
         GPUArena {
-            gpu: self.weak.clone(),
+            gpu: self.weak.upgrade().unwrap(),
             memory,
             block_size,
             blocks: vec![
@@ -940,7 +964,7 @@ impl GPU {
             .set_layouts(&self.descriptor_layouts);
         let desc_sets = unsafe { self.device.allocate_descriptor_sets(&alloc_info).unwrap() };
         GPUDescriptorHeap {
-            gpu: self.weak.clone(),
+            gpu: self.weak.upgrade().unwrap(),
             pool,
             textures: desc_sets[0],
             textures_rw: desc_sets[1],
@@ -973,9 +997,33 @@ impl Default for TextureDesc {
 }
 impl Drop for GPU {
     fn drop(&mut self) {
-        /*unsafe {
+        self.allocator = None;
+        for thread_local in self.thread_local.iter_mut() {
+            let thread_local = thread_local.get_mut();
+            for pool in thread_local.vk_pools {
+                unsafe { self.device.destroy_command_pool(pool, None) };
+            }
+        }
+        for semaphore in self.command_buffer_semaphores {
+            unsafe {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+        }
+        for descriptor_set in self.descriptor_layouts.drain(..) {
+            unsafe {
+                self.device
+                    .destroy_descriptor_set_layout(descriptor_set, None)
+            };
+        }
+        unsafe {
+            self.device
+                .destroy_pipeline_layout(self.common_pipeline_graphics_layout, None);
+            self.device
+                .destroy_pipeline_layout(self.common_pipeline_compute_layout, None);
+        }
+        unsafe {
             self.device.destroy_device(None);
-        }*/
+        }
     }
 }
 pub struct PooledCommandBuffer {
@@ -1006,7 +1054,7 @@ pub struct GPUThreadLocalStorage {
 pub struct GPUCommandBuffer {
     command_buffer: vk::CommandBuffer,
     queue: QueueKind,
-    gpu: Weak<GPU>,
+    gpu: Arc<GPU>,
     waiting: Vec<(vk::Semaphore, u64)>,
     signalling: Vec<(vk::Semaphore, u64)>,
     _marker: PhantomData<*mut ()>, //not send
@@ -1021,7 +1069,6 @@ impl GPUCommandBuffer {
         self.signalling.push((semaphore.semaphore, value));
     }
     pub fn begin_render<'a>(&'a mut self, mut desc: RenderPassDesc) -> GPURenderPass<'a> {
-        let gpu = self.gpu.upgrade().unwrap();
         let mut sample_count = 0;
         for color_attachment in desc.color_attachments {
             sample_count = sample_count.max(color_attachment.texture.sample_count);
@@ -1088,45 +1135,54 @@ impl GPUCommandBuffer {
             if let Some(stencil_attachment) = &stencil_attachment {
                 info = info.stencil_attachment(stencil_attachment);
             }
-            gpu.device.cmd_begin_rendering(self.command_buffer, &info);
-            gpu.device
+            self.gpu
+                .device
+                .cmd_begin_rendering(self.command_buffer, &info);
+            self.gpu
+                .device
                 .cmd_set_stencil_test_enable(self.command_buffer, false);
-            gpu.shader_object_device.cmd_set_color_blend_enable(
+            self.gpu.shader_object_device.cmd_set_color_blend_enable(
                 self.command_buffer,
                 0,
                 std::iter::repeat_n(0, desc.color_attachments.len())
                     .collect::<Vec<_>>()
                     .as_slice(),
             );
-            gpu.shader_object_device.cmd_set_color_write_mask(
+            self.gpu.shader_object_device.cmd_set_color_write_mask(
                 self.command_buffer,
                 0,
                 std::iter::repeat_n(vk::ColorComponentFlags::RGBA, desc.color_attachments.len())
                     .collect::<Vec<_>>()
                     .as_slice(),
             );
-            gpu.shader_object_device.cmd_set_rasterization_samples(
+            self.gpu.shader_object_device.cmd_set_rasterization_samples(
                 self.command_buffer,
                 to_vk_sample_count(sample_count),
             );
-            gpu.shader_object_device.cmd_set_primitive_topology(
+            self.gpu.shader_object_device.cmd_set_primitive_topology(
                 self.command_buffer,
                 vk::PrimitiveTopology::TRIANGLE_LIST,
             );
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_polygon_mode(self.command_buffer, vk::PolygonMode::FILL);
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_cull_mode(self.command_buffer, vk::CullModeFlags::NONE); //todo: configurable
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_depth_compare_op(self.command_buffer, vk::CompareOp::ALWAYS); //todo
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_depth_bias_enable(self.command_buffer, false);
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_depth_write_enable(self.command_buffer, false);
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_depth_test_enable(self.command_buffer, false);
 
-            gpu.shader_object_device.cmd_set_viewport_with_count(
+            self.gpu.shader_object_device.cmd_set_viewport_with_count(
                 self.command_buffer,
                 &[vk::Viewport {
                     x: 0.,
@@ -1137,7 +1193,7 @@ impl GPUCommandBuffer {
                     max_depth: 1.,
                 }],
             );
-            gpu.shader_object_device.cmd_set_scissor_with_count(
+            self.gpu.shader_object_device.cmd_set_scissor_with_count(
                 self.command_buffer,
                 &[vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
@@ -1147,9 +1203,10 @@ impl GPUCommandBuffer {
                     },
                 }],
             );
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_rasterizer_discard_enable(self.command_buffer, false);
-            gpu.shader_object_device.cmd_set_color_blend_equation(
+            self.gpu.shader_object_device.cmd_set_color_blend_equation(
                 self.command_buffer,
                 0,
                 &[vk::ColorBlendEquationEXT {
@@ -1161,19 +1218,23 @@ impl GPUCommandBuffer {
                     alpha_blend_op: vk::BlendOp::ADD,
                 }],
             );
-            gpu.shader_object_device.cmd_set_sample_mask(
+            self.gpu.shader_object_device.cmd_set_sample_mask(
                 self.command_buffer,
                 to_vk_sample_count(sample_count),
                 &[255],
             );
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_alpha_to_coverage_enable(self.command_buffer, false);
 
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_depth_clip_enable(self.command_buffer, true);
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_vertex_input(self.command_buffer, &[], &[]);
-            gpu.shader_object_device
+            self.gpu
+                .shader_object_device
                 .cmd_set_primitive_restart_enable(self.command_buffer, false);
         }
         GPURenderPass {
@@ -1182,13 +1243,12 @@ impl GPUCommandBuffer {
         }
     }
     pub fn set_compute_shader(&mut self, shader: &GPUShader) {
-        let gpu = self.gpu.upgrade().unwrap();
         match shader.kind {
             ShaderKind::Compute => {}
             _ => panic!("wrong type of shader bound"),
         }
         unsafe {
-            gpu.shader_object_device.cmd_bind_shaders(
+            self.gpu.shader_object_device.cmd_bind_shaders(
                 self.command_buffer,
                 &[vk::ShaderStageFlags::COMPUTE],
                 &[shader.shader],
@@ -1197,33 +1257,33 @@ impl GPUCommandBuffer {
         self.has_compute_shader = true;
     }
     pub fn dispatch<D: bytemuck::Pod>(&mut self, data: D, groups: [u32; 3]) {
-        let gpu = self.gpu.upgrade().unwrap();
         assert!(
-            std::mem::size_of::<D>() <= gpu.settings.max_push_constant_size,
+            std::mem::size_of::<D>() <= self.gpu.settings.max_push_constant_size,
             "compute data size greater than set size"
         );
         assert!(self.has_compute_shader);
         unsafe {
-            gpu.device.cmd_push_constants(
+            self.gpu.device.cmd_push_constants(
                 self.command_buffer,
-                gpu.common_pipeline_compute_layout,
+                self.gpu.common_pipeline_compute_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
                 bytemuck::bytes_of(&data),
             );
-            gpu.device
+            self.gpu
+                .device
                 .cmd_dispatch(self.command_buffer, groups[0], groups[1], groups[2]);
         }
     }
     pub fn copy(&mut self, src: GPUPointer, dst: GPUPointer) {
         assert_eq!(src.size, dst.size);
-        let gpu = self.gpu.upgrade().unwrap();
         let copy = vk::BufferCopy::default()
             .src_offset(src.offset)
             .dst_offset(dst.offset)
             .size(src.size);
         unsafe {
-            gpu.device
+            self.gpu
+                .device
                 .cmd_copy_buffer(self.command_buffer, src.buffer, dst.buffer, &[copy]);
         }
     }
@@ -1233,7 +1293,6 @@ impl GPUCommandBuffer {
         texture_region: TextureRegion,
         src: GPUPointer,
     ) {
-        let gpu = self.gpu.upgrade().unwrap();
         let aspect_mask = texture.format.to_vk_aspect_flags();
         let is_compressed = match texture.format {
             TextureFormat::BC1RGBAUnorm
@@ -1277,7 +1336,7 @@ impl GPUCommandBuffer {
                 depth: copy_extent[2],
             });
         unsafe {
-            gpu.device.cmd_copy_buffer_to_image(
+            self.gpu.device.cmd_copy_buffer_to_image(
                 self.command_buffer,
                 src.buffer,
                 texture.image,
@@ -1288,16 +1347,17 @@ impl GPUCommandBuffer {
     }
     pub fn submit(mut self) {
         self.submitted = true;
-        let gpu = self.gpu.upgrade().unwrap();
         unsafe {
-            gpu.device.end_command_buffer(self.command_buffer).unwrap();
+            self.gpu
+                .device
+                .end_command_buffer(self.command_buffer)
+                .unwrap();
         }
-        let mut counters = gpu.command_buffer_counters.lock().unwrap();
+        let mut counters = self.gpu.command_buffer_counters.lock().unwrap();
         let cnt = counters[self.queue as usize] + 1;
         counters[self.queue as usize] = cnt;
 
-        let mut signal_semaphores =
-            vec![gpu.command_buffer_semaphores[self.queue as usize].semaphore];
+        let mut signal_semaphores = vec![self.gpu.command_buffer_semaphores[self.queue as usize]];
         let mut signal_counters = vec![cnt];
 
         let mut wait_semaphores = Vec::new();
@@ -1325,16 +1385,17 @@ impl GPUCommandBuffer {
             .push_next(&mut timeline_submit_info);
 
         unsafe {
-            gpu.device
+            self.gpu
+                .device
                 .queue_submit(
-                    gpu.queues[self.queue as usize],
+                    self.gpu.queues[self.queue as usize],
                     &[submit_info],
                     vk::Fence::null(),
                 )
                 .unwrap();
         }
 
-        gpu.thread_local.get().unwrap().borrow_mut().pools[self.queue as usize].push(
+        self.gpu.thread_local.get().unwrap().borrow_mut().pools[self.queue as usize].push(
             PooledCommandBuffer {
                 command_buffer: self.command_buffer,
                 timestamp: cnt,
@@ -1342,21 +1403,20 @@ impl GPUCommandBuffer {
         );
     }
     pub fn bind_descriptor_heap(&self, heap: &GPUDescriptorHeap) {
-        let gpu = self.gpu.upgrade().unwrap();
         let descriptor_sets = [heap.textures, heap.textures_rw, heap.samplers];
         unsafe {
-            gpu.device.cmd_bind_descriptor_sets(
+            self.gpu.device.cmd_bind_descriptor_sets(
                 self.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
-                gpu.common_pipeline_graphics_layout,
+                self.gpu.common_pipeline_graphics_layout,
                 0,
                 &descriptor_sets,
                 &[],
             );
-            gpu.device.cmd_bind_descriptor_sets(
+            self.gpu.device.cmd_bind_descriptor_sets(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
-                gpu.common_pipeline_compute_layout,
+                self.gpu.common_pipeline_compute_layout,
                 0,
                 &descriptor_sets,
                 &[],
@@ -1381,14 +1441,16 @@ impl GPURenderPass<'_> {
             (ShaderKind::Vertex, ShaderKind::Fragment) => {}
             _ => panic!("wrong type of shader bound"),
         }
-        let gpu = self.command_buffer.gpu.upgrade().unwrap();
         self.has_shaders_bound = true;
         unsafe {
-            gpu.shader_object_device.cmd_bind_shaders(
-                self.command_buffer.command_buffer,
-                &[vk::ShaderStageFlags::VERTEX, vk::ShaderStageFlags::FRAGMENT],
-                &[vertex.shader, fragment.shader],
-            )
+            self.command_buffer
+                .gpu
+                .shader_object_device
+                .cmd_bind_shaders(
+                    self.command_buffer.command_buffer,
+                    &[vk::ShaderStageFlags::VERTEX, vk::ShaderStageFlags::FRAGMENT],
+                    &[vertex.shader, fragment.shader],
+                )
         };
     }
     pub fn set_shaders(&mut self, shaders: &GraphicsShaders) {
@@ -1402,7 +1464,7 @@ impl GPURenderPass<'_> {
         index_buffer: Option<(GPUPointer, IndexBufferFormat)>,
         draw_options: DrawOptions,
     ) {
-        let gpu = self.command_buffer.gpu.upgrade().unwrap();
+        let gpu = &self.command_buffer.gpu;
         assert!(
             std::mem::size_of::<D>() <= gpu.settings.max_push_constant_size,
             "draw data size greater than set size"
@@ -1451,9 +1513,10 @@ impl GPURenderPass<'_> {
 }
 impl Drop for GPURenderPass<'_> {
     fn drop(&mut self) {
-        let gpu = self.command_buffer.gpu.upgrade().unwrap();
         unsafe {
-            gpu.device
+            self.command_buffer
+                .gpu
+                .device
                 .cmd_end_rendering(self.command_buffer.command_buffer);
         }
     }
@@ -1673,7 +1736,7 @@ pub struct GPUTexture {
     view_cache: Mutex<HashMap<TextureViewDesc, vk::ImageView>>,
     allocation: Option<Allocation>,
     is_swapchain: bool,
-    gpu: Weak<GPU>,
+    gpu: Arc<GPU>,
 }
 impl GPUTexture {
     fn get_view(&self, view_desc: &TextureViewDesc) -> vk::ImageView {
@@ -1682,13 +1745,13 @@ impl GPUTexture {
             .unwrap()
             .entry(view_desc.clone())
             .or_insert_with(|| {
-                let gpu = self.gpu.upgrade().unwrap();
                 assert!(
                     view_desc.base_layer as u32 + view_desc.layer_count as u32 <= self.layer_count
                 );
                 assert!(view_desc.base_mip as u32 + view_desc.mip_count as u32 <= self.mip_count);
                 unsafe {
-                    gpu.device
+                    self.gpu
+                        .device
                         .create_image_view(
                             &vk::ImageViewCreateInfo::default()
                                 .image(self.image.clone())
@@ -1711,19 +1774,24 @@ impl GPUTexture {
 }
 impl Drop for GPUTexture {
     fn drop(&mut self) {
-        if let Some(gpu) = self.gpu.upgrade() {
-            if let Some(allocation) = self.allocation.take() {
-                gpu.allocator.lock().unwrap().free(allocation).unwrap();
+        if let Some(allocation) = self.allocation.take() {
+            self.gpu
+                .allocator
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .free(allocation)
+                .unwrap();
+        }
+        for (_, view) in self.view_cache.get_mut().unwrap() {
+            unsafe {
+                self.gpu.device.destroy_image_view(*view, None);
             }
-            for (_, view) in self.view_cache.get_mut().unwrap() {
-                unsafe {
-                    gpu.device.destroy_image_view(*view, None);
-                }
-            }
-            if !self.is_swapchain {
-                unsafe {
-                    gpu.device.destroy_image(self.image, None);
-                }
+        }
+        if !self.is_swapchain {
+            unsafe {
+                self.gpu.device.destroy_image(self.image, None);
             }
         }
     }
@@ -1732,7 +1800,7 @@ pub struct GPUBuffer {
     allocation: Option<Allocation>,
     buffer: vk::Buffer,
     gpu_pointer: vk::DeviceAddress,
-    gpu: Weak<GPU>,
+    gpu: Arc<GPU>,
 }
 impl GPUBuffer {
     pub fn gpu(&self) -> vk::DeviceAddress {
@@ -1752,24 +1820,25 @@ impl GPUBuffer {
 }
 impl Drop for GPUBuffer {
     fn drop(&mut self) {
-        if let Some(gpu) = self.gpu.upgrade() {
-            gpu.allocator
-                .lock()
-                .unwrap()
-                .free(self.allocation.take().unwrap())
-                .unwrap();
-            unsafe {
-                gpu.device.destroy_buffer(self.buffer, None);
-            }
+        self.gpu
+            .allocator
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .free(self.allocation.take().unwrap())
+            .unwrap();
+        unsafe {
+            self.gpu.device.destroy_buffer(self.buffer, None);
         }
     }
 }
 pub struct GPUSemaphore {
     semaphore: vk::Semaphore,
-    gpu: Weak<GPU>,
+    gpu: Arc<GPU>,
 }
 impl GPUSemaphore {
-    fn create_raw(device: &ash::Device, gpu: &Weak<GPU>, value: u64) -> GPUSemaphore {
+    fn create_raw(device: &ash::Device, gpu: Arc<GPU>, value: u64) -> GPUSemaphore {
         let mut semaphore_create_type_info = vk::SemaphoreTypeCreateInfo::default()
             .initial_value(value)
             .semaphore_type(vk::SemaphoreType::TIMELINE);
@@ -1781,12 +1850,9 @@ impl GPUSemaphore {
                 )
                 .unwrap()
         };
-        GPUSemaphore {
-            semaphore,
-            gpu: gpu.clone(),
-        }
+        GPUSemaphore { semaphore, gpu }
     }
-    fn create_binary(device: &ash::Device, gpu: &Weak<GPU>) -> GPUSemaphore {
+    fn create_binary(device: &ash::Device, gpu: Arc<GPU>) -> GPUSemaphore {
         let mut semaphore_create_type_info =
             vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::BINARY);
         let semaphore = unsafe {
@@ -1797,23 +1863,20 @@ impl GPUSemaphore {
                 )
                 .unwrap()
         };
-        GPUSemaphore {
-            semaphore,
-            gpu: gpu.clone(),
-        }
+        GPUSemaphore { semaphore, gpu }
     }
     pub fn get_value(&self) -> u64 {
-        let gpu = self.gpu.upgrade().unwrap();
         unsafe {
-            gpu.device
+            self.gpu
+                .device
                 .get_semaphore_counter_value(self.semaphore.clone())
                 .unwrap()
         }
     }
     pub fn wait(&self, value: u64) {
-        let gpu = self.gpu.upgrade().unwrap();
         unsafe {
-            gpu.device
+            self.gpu
+                .device
                 .wait_semaphores(
                     &vk::SemaphoreWaitInfo::default()
                         .semaphores(&[self.semaphore])
@@ -1826,17 +1889,15 @@ impl GPUSemaphore {
 }
 impl Drop for GPUSemaphore {
     fn drop(&mut self) {
-        if let Some(gpu) = self.gpu.upgrade() {
-            unsafe {
-                gpu.device.destroy_semaphore(self.semaphore, None);
-            }
+        unsafe {
+            self.gpu.device.destroy_semaphore(self.semaphore, None);
         }
     }
 }
 pub struct GPUShader {
     shader: vk::ShaderEXT,
     kind: ShaderKind,
-    gpu: Weak<GPU>,
+    gpu: Arc<GPU>,
 }
 #[derive(Clone, Copy)]
 pub enum ShaderKind {
@@ -1846,16 +1907,16 @@ pub enum ShaderKind {
 }
 impl Drop for GPUShader {
     fn drop(&mut self) {
-        if let Some(gpu) = self.gpu.upgrade() {
-            unsafe {
-                gpu.shader_object_device.destroy_shader(self.shader, None);
-            }
+        unsafe {
+            self.gpu
+                .shader_object_device
+                .destroy_shader(self.shader, None);
         }
     }
 }
 pub struct GPUSwapchain {
     textures: Vec<Arc<GPUTexture>>,
-    gpu: Weak<GPU>,
+    gpu: Arc<GPU>,
     present_semaphores: Vec<GPUSemaphore>,
     swapchain: vk::SwapchainKHR,
     next_swap_image: u32,
@@ -1941,7 +2002,7 @@ impl GPUSwapchain {
                 mip_count: 1,
                 allocation: None,
                 view_cache: Default::default(),
-                gpu: gpu.weak.clone(),
+                gpu: gpu.weak.upgrade().unwrap(),
                 texture_type: TextureType::D2,
                 is_swapchain: true,
             })
@@ -1950,21 +2011,23 @@ impl GPUSwapchain {
     }
     pub fn acquire_next(&mut self) -> (Arc<GPUTexture>, SwapchainResult) {
         unsafe {
-            let gpu = self.gpu.upgrade().unwrap();
-            let fence = gpu
+            let fence = self
+                .gpu
                 .device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .unwrap();
-            let (index, suboptimal) = gpu
+            let (index, suboptimal) = self
+                .gpu
                 .swapchain_device
                 .acquire_next_image(self.swapchain, u64::MAX, vk::Semaphore::null(), fence)
                 .unwrap();
             self.next_swap_image = index;
-            gpu.device
+            self.gpu
+                .device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .unwrap();
-            gpu.device.destroy_fence(fence, None);
-            let command_buffer = gpu.begin_commands(QueueKind::Main);
+            self.gpu.device.destroy_fence(fence, None);
+            let command_buffer = self.gpu.begin_commands(QueueKind::Main);
             let image_barrier = vk::ImageMemoryBarrier2::default()
                 .image(self.textures[index as usize].image)
                 .subresource_range(vk::ImageSubresourceRange {
@@ -1980,7 +2043,7 @@ impl GPUSwapchain {
                 .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
-            gpu.device.cmd_pipeline_barrier2(
+            self.gpu.device.cmd_pipeline_barrier2(
                 command_buffer.command_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&[image_barrier]),
             );
@@ -2001,8 +2064,7 @@ impl GPUSwapchain {
         wait_semaphore: &GPUSemaphore,
         wait_value: u64,
     ) -> SwapchainResult {
-        let gpu = self.gpu.upgrade().unwrap();
-        let mut command_buffer = gpu.begin_commands(queue);
+        let mut command_buffer = self.gpu.begin_commands(queue);
         let image_barrier = vk::ImageMemoryBarrier2::default()
             .image(self.textures[self.next_swap_image as usize].image)
             .subresource_range(vk::ImageSubresourceRange {
@@ -2019,7 +2081,7 @@ impl GPUSwapchain {
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags2::MEMORY_READ);
         unsafe {
-            gpu.device.cmd_pipeline_barrier2(
+            self.gpu.device.cmd_pipeline_barrier2(
                 command_buffer.command_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&[image_barrier]),
             )
@@ -2027,12 +2089,13 @@ impl GPUSwapchain {
         command_buffer.add_wait(wait_semaphore, wait_value);
         command_buffer.add_signal(&self.present_semaphores[self.next_swap_image as usize], 0);
         command_buffer.submit();
-        let _queue_lock = gpu.command_buffer_counters.lock().unwrap();
+        let _queue_lock = self.gpu.command_buffer_counters.lock().unwrap();
         unsafe {
-            let suboptimal = gpu
+            let suboptimal = self
+                .gpu
                 .swapchain_device
                 .queue_present(
-                    gpu.queues[queue as usize],
+                    self.gpu.queues[queue as usize],
                     &vk::PresentInfoKHR::default()
                         .image_indices(&[self.next_swap_image])
                         .swapchains(&[self.swapchain])
@@ -2048,18 +2111,20 @@ impl GPUSwapchain {
         }
     }
     pub fn recreate(&mut self) {
-        let gpu = self.gpu.upgrade().unwrap();
-        gpu.queue_wait_idle(QueueKind::Main);
+        self.gpu.queue_wait_idle(QueueKind::Main);
         self.textures.clear();
         //todo: use old_swapchain
         unsafe {
-            gpu.swapchain_device.destroy_swapchain(self.swapchain, None);
+            self.gpu
+                .swapchain_device
+                .destroy_swapchain(self.swapchain, None);
         }
-        self.swapchain = GPUSwapchain::make_swapchain(&gpu, self.surface, &mut self.textures);
-        self.present_semaphores =
-            std::iter::repeat_with(|| GPUSemaphore::create_binary(&gpu.device, &gpu.weak))
-                .take(self.textures.len())
-                .collect();
+        self.swapchain = GPUSwapchain::make_swapchain(&self.gpu, self.surface, &mut self.textures);
+        self.present_semaphores = std::iter::repeat_with(|| {
+            GPUSemaphore::create_binary(&self.gpu.device, self.gpu.clone())
+        })
+        .take(self.textures.len())
+        .collect();
     }
 }
 pub enum SwapchainResult {
@@ -2068,13 +2133,14 @@ pub enum SwapchainResult {
 }
 impl Drop for GPUSwapchain {
     fn drop(&mut self) {
-        if let Some(gpu) = self.gpu.upgrade() {
-            unsafe {
-                gpu.swapchain_device.destroy_swapchain(self.swapchain, None);
-            }
-            unsafe {
-                gpu.surface_loader.destroy_surface(self.surface, None);
-            }
+        self.gpu.queue_wait_idle(QueueKind::Main);
+        unsafe {
+            self.gpu
+                .swapchain_device
+                .destroy_swapchain(self.swapchain, None);
+        }
+        unsafe {
+            self.gpu.surface_loader.destroy_surface(self.surface, None);
         }
     }
 }
@@ -2121,7 +2187,7 @@ fn to_vk_sample_count(sample_count: u32) -> vk::SampleCountFlags {
     }
 }
 pub struct GPUArena {
-    gpu: Weak<GPU>,
+    gpu: Arc<GPU>,
     memory: MemoryKind,
     block_size: usize,
     blocks: Vec<GPUBuffer>,
@@ -2144,8 +2210,7 @@ impl GPUArena {
         if next_addr_align + layout.size() > self.block_size {
             self.block_index += 1;
             if self.block_index >= self.blocks.len() {
-                let gpu = self.gpu.upgrade().unwrap();
-                self.blocks.push(gpu.allocate_buffer(
+                self.blocks.push(self.gpu.allocate_buffer(
                     Layout::from_size_align(self.block_size, 16).unwrap(),
                     self.memory,
                 ));
@@ -2182,7 +2247,7 @@ pub struct GraphicsShaders {
     pub fragment: GPUShader,
 }
 pub struct GPUDescriptorHeap {
-    gpu: Weak<GPU>,
+    gpu: Arc<GPU>,
     pool: vk::DescriptorPool,
     textures: vk::DescriptorSet,
     textures_rw: vk::DescriptorSet,
@@ -2191,7 +2256,6 @@ pub struct GPUDescriptorHeap {
 }
 impl GPUDescriptorHeap {
     pub fn set_textures(&mut self, offset: usize, textures: &[(&GPUTexture, TextureViewDesc)]) {
-        let gpu = self.gpu.upgrade().unwrap();
         let mut infos = Vec::new();
         for (texture, view) in textures {
             infos.push(
@@ -2206,10 +2270,9 @@ impl GPUDescriptorHeap {
             .dst_array_element(offset as u32)
             .image_info(&infos)
             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE);
-        unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
+        unsafe { self.gpu.device.update_descriptor_sets(&[write], &[]) };
     }
     pub fn set_textures_rw(&mut self, offset: usize, textures: &[(&GPUTexture, TextureViewDesc)]) {
-        let gpu = self.gpu.upgrade().unwrap();
         let mut infos = Vec::new();
         for (texture, view) in textures {
             infos.push(
@@ -2224,10 +2287,9 @@ impl GPUDescriptorHeap {
             .dst_array_element(offset as u32)
             .image_info(&infos)
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE);
-        unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
+        unsafe { self.gpu.device.update_descriptor_sets(&[write], &[]) };
     }
     pub fn set_samplers(&mut self, offset: usize, samplers: &[TextureSampler]) {
-        let gpu = self.gpu.upgrade().unwrap();
         let mut infos = Vec::new();
         for sampler in samplers {
             infos.push(vk::DescriptorImageInfo::default().sampler(
@@ -2242,7 +2304,7 @@ impl GPUDescriptorHeap {
                         .min_filter(sampler.min.to_vk())
                         .mag_filter(sampler.mag.to_vk())
                         .mipmap_mode(sampler.mip.to_vk_mip());
-                    unsafe { gpu.device.create_sampler(&create_info, None).unwrap() }
+                    unsafe { self.gpu.device.create_sampler(&create_info, None).unwrap() }
                 }),
             ));
         }
@@ -2252,22 +2314,21 @@ impl GPUDescriptorHeap {
             .dst_array_element(offset as u32)
             .image_info(&infos)
             .descriptor_type(vk::DescriptorType::SAMPLER);
-        unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
+        unsafe { self.gpu.device.update_descriptor_sets(&[write], &[]) };
     }
 }
 impl Drop for GPUDescriptorHeap {
     fn drop(&mut self) {
-        if let Some(gpu) = self.gpu.upgrade() {
-            unsafe {
-                gpu.device
-                    .free_descriptor_sets(
-                        self.pool,
-                        &[self.textures, self.textures_rw, self.samplers],
-                    )
-                    .unwrap();
-                gpu.device.destroy_descriptor_pool(self.pool, None);
-            };
-        }
+        unsafe {
+            self.gpu
+                .device
+                .free_descriptor_sets(self.pool, &[self.textures, self.textures_rw, self.samplers])
+                .unwrap();
+            self.gpu.device.destroy_descriptor_pool(self.pool, None);
+            for sampler in self.sampler_cache.values() {
+                self.gpu.device.destroy_sampler(*sampler, None);
+            }
+        };
     }
 }
 #[derive(Hash, Clone, Copy, PartialEq, Eq)]
