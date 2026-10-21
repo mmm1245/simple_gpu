@@ -4,9 +4,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     ffi::CString,
     marker::PhantomData,
-    ops::{Rem, Sub},
     sync::{Arc, Mutex, Weak},
-    time::Instant,
 };
 
 use ash::{
@@ -22,215 +20,8 @@ use gpu_allocator::{
     MemoryLocation,
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc},
 };
+use raw_window_handle::{DisplayHandle, WindowHandle};
 use thread_local::ThreadLocal;
-use winit::{
-    application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
-    raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle},
-    window::WindowId,
-};
-
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct Vertex {
-    pos: [f32; 3],
-    color: [f32; 3],
-}
-
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct DrawConstants {
-    vertex_data: u64,
-    time: f32,
-    _pad: u32,
-}
-
-#[derive(Default)]
-struct App {
-    data: Option<AppData>,
-}
-struct AppData {
-    window: winit::window::Window,
-    gpu: Arc<GPU>,
-    swapchain: GPUSwapchain,
-    semaphore: GPUSemaphore,
-    next_frame: u64,
-    shaders: GraphicsShaders,
-    frame_arenas: [GPUArena; 3],
-    start_time: Instant,
-    desc_heap: GPUDescriptorHeap,
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.data.is_some() {
-            return;
-        }
-        let window = event_loop
-            .create_window(winit::window::Window::default_attributes())
-            .unwrap();
-        let gpu = GPU::init(GPUSettings {
-            instance_extensions: GPUSettings::get_required_extensions(
-                window.display_handle().unwrap(),
-            ),
-            ..Default::default()
-        })
-        .unwrap();
-        let semaphore = gpu.create_semaphore(0);
-        let swapchain = gpu.create_swapchain(
-            window.display_handle().unwrap(),
-            window.window_handle().unwrap(),
-        );
-        let shader = include_bytes!("shader.spv");
-        let shaders = gpu
-            .create_shaders_graphic_spirv(shader, "vertexMain", "fragmentMain", &Default::default())
-            .unwrap();
-        let frame_arenas = std::array::from_fn(|_| gpu.allocate_arena(1024 * 1024 * 8));
-        let mut desc_heap = gpu.create_descriptor_heap();
-        desc_heap.set_samplers(
-            0,
-            &[TextureSampler {
-                ..Default::default()
-            }],
-        );
-        let upload_semaphore = gpu.create_semaphore(0);
-        let image = image::open("image.png").unwrap().into_rgba8();
-        let image_buffer = image
-            .pixels()
-            .map(|rgba| rgba.0.into_iter())
-            .flatten()
-            .collect::<Vec<_>>();
-        let texture = gpu.create_texture(
-            TextureDesc {
-                dimensions: [image.width(), image.height(), 1],
-                usage: TextureUsage::SAMPLED,
-                ..Default::default()
-            },
-            QueueKind::Main,
-            &upload_semaphore,
-            1,
-        );
-        let mut upload_arena = gpu.allocate_arena(4 * 1024 * 1024);
-        let mut upload_buffer = gpu.begin_commands(QueueKind::Main);
-        upload_buffer.add_wait(&upload_semaphore, 1);
-        upload_buffer.add_signal(&upload_semaphore, 2);
-        upload_buffer.copy_to_texture(
-            &texture,
-            TextureRegion::default(),
-            upload_arena.alloc(image_buffer.as_slice()),
-        );
-        upload_buffer.submit();
-        upload_semaphore.wait(2);
-        desc_heap.set_textures(1, &[(&texture, TextureViewDesc::default())]);
-
-        self.data = Some(AppData {
-            frame_arenas,
-            window,
-            gpu,
-            swapchain,
-            semaphore,
-            next_frame: 1,
-            shaders,
-            start_time: Instant::now(),
-            desc_heap,
-        });
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => {
-                println!("The close button was pressed; stopping");
-                event_loop.exit();
-            }
-            WindowEvent::RedrawRequested => {
-                let Some(data) = &mut self.data else { return };
-                if data.next_frame > 3 {
-                    data.semaphore.wait(data.next_frame - 3);
-                }
-
-                let frame_arena = &mut data.frame_arenas[data.next_frame as usize % 3];
-                frame_arena.clear();
-                let time = data.start_time.elapsed().as_secs_f32();
-                let mod_time = time.rem(2.).sub(1.).abs();
-                let vertices = frame_arena.alloc(&[
-                    Vertex {
-                        pos: [0., 0., 0.],
-                        color: [mod_time, 0., 0.],
-                    },
-                    Vertex {
-                        pos: [1., 0., 0.],
-                        color: [0., mod_time, 0.],
-                    },
-                    Vertex {
-                        pos: [0., 1., 0.],
-                        color: [0., 0., mod_time],
-                    },
-                    Vertex {
-                        pos: [1., 1., 0.],
-                        color: [0., 0., 0.],
-                    },
-                ]);
-                let indices = frame_arena.alloc::<u16>(&[0, 1, 2, 1, 3, 2]);
-
-                let mut commands = data.gpu.begin_commands(QueueKind::Main);
-                commands.bind_descriptor_heap(&data.desc_heap);
-                let target = data.swapchain.acquire_next().0;
-                {
-                    let mut render_pass = commands.begin_render(RenderPassDesc {
-                        color_attachments: &[RenderPassAttachment {
-                            load: RenderPassLoadOp::Clear([1., 1., 0., 1.]),
-                            store: RenderPassStoreOp::Store,
-                            resolve: None,
-                            texture: &target,
-                            view: Default::default(),
-                        }],
-                        ..Default::default()
-                    });
-                    render_pass.set_shaders(&data.shaders);
-                    render_pass.draw(
-                        DrawConstants {
-                            vertex_data: vertices.gpu(),
-                            time,
-                            _pad: 0,
-                        },
-                        6,
-                        1,
-                        Some((indices, IndexBufferFormat::U16)),
-                        Default::default(),
-                    );
-                }
-                commands.add_signal(&data.semaphore, data.next_frame);
-                commands.submit();
-
-                match data
-                    .swapchain
-                    .present(QueueKind::Main, &data.semaphore, data.next_frame)
-                {
-                    SwapchainResult::Ok => {}
-                    SwapchainResult::Suboptimal => {
-                        data.swapchain.recreate();
-                    }
-                }
-
-                data.next_frame += 1;
-                //println!("frame rendered {}", self.bump_value);
-
-                data.window.request_redraw();
-            }
-            WindowEvent::Resized(_) => {}
-            _ => (),
-        }
-    }
-}
-
-fn main() -> VkResult<()> {
-    let event_loop = EventLoop::new().unwrap();
-    //event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::default();
-    event_loop.run_app(&mut app);
-    Ok(())
-}
 
 pub struct GPU {
     entry: ash::Entry,
@@ -520,15 +311,13 @@ impl GPU {
                     let mut semaphore_create_type_info = vk::SemaphoreTypeCreateInfo::default()
                         .initial_value(0)
                         .semaphore_type(vk::SemaphoreType::TIMELINE);
-                    unsafe {
-                        device
-                            .create_semaphore(
-                                &vk::SemaphoreCreateInfo::default()
-                                    .push_next(&mut semaphore_create_type_info),
-                                None,
-                            )
-                            .unwrap()
-                    }
+                    device
+                        .create_semaphore(
+                            &vk::SemaphoreCreateInfo::default()
+                                .push_next(&mut semaphore_create_type_info),
+                            None,
+                        )
+                        .unwrap()
                 }),
                 common_pipeline_graphics_layout,
                 common_pipeline_compute_layout,
@@ -743,7 +532,6 @@ impl GPU {
                     gpu: self.weak.upgrade().unwrap(),
                     signalling: Vec::new(),
                     waiting: Vec::new(),
-                    submitted: false,
                     _marker: PhantomData,
                     has_compute_shader: false,
                 };
@@ -769,7 +557,6 @@ impl GPU {
             gpu: self.weak.upgrade().unwrap(),
             signalling: Vec::new(),
             waiting: Vec::new(),
-            submitted: false,
             _marker: PhantomData,
             has_compute_shader: false,
         }
@@ -855,7 +642,7 @@ impl GPU {
         let image_barrier = vk::ImageMemoryBarrier2::default()
             .image(image)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: desc.format.to_vk_aspect_flags(),
+                aspect_mask: TextureFormat::aspect_flags(desc.format.to_vk()),
                 layer_count: desc.layer_count,
                 level_count: desc.mip_count,
                 base_array_layer: 0,
@@ -878,7 +665,7 @@ impl GPU {
         GPUTexture {
             texture_type: desc.texture_type,
             dimensions: desc.dimensions,
-            format: desc.format,
+            format: desc.format.to_vk(),
             mip_count: desc.mip_count,
             layer_count: desc.layer_count,
             sample_count: desc.sample_count,
@@ -1058,7 +845,6 @@ pub struct GPUCommandBuffer {
     waiting: Vec<(vk::Semaphore, u64)>,
     signalling: Vec<(vk::Semaphore, u64)>,
     _marker: PhantomData<*mut ()>, //not send
-    submitted: bool,
     has_compute_shader: bool,
 }
 impl GPUCommandBuffer {
@@ -1067,6 +853,45 @@ impl GPUCommandBuffer {
     }
     pub fn add_signal(&mut self, semaphore: &GPUSemaphore, value: u64) {
         self.signalling.push((semaphore.semaphore, value));
+    }
+    pub fn barrier(&mut self, before: GPUStage, after: GPUStage, hazards: &[GPUHazard]) {
+        let mut src_access = vk::AccessFlags::empty();
+        let mut dst_access = vk::AccessFlags::empty();
+        if hazards.is_empty() {
+            src_access |= vk::AccessFlags::MEMORY_WRITE;
+            dst_access |= vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE;
+        }
+        for hazard in hazards {
+            match hazard {
+                GPUHazard::DrawArguments => {
+                    src_access |= vk::AccessFlags::SHADER_WRITE;
+                    dst_access |= vk::AccessFlags::INDIRECT_COMMAND_READ;
+                }
+                GPUHazard::Descriptors => {
+                    src_access |= vk::AccessFlags::SHADER_WRITE;
+                    dst_access |= vk::AccessFlags::SHADER_READ;
+                }
+                GPUHazard::DepthStencil => {
+                    src_access |= vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE;
+                    dst_access |= vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ;
+                }
+            }
+            let barrier_info = vk::MemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access);
+            unsafe {
+                self.gpu.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    before.to_vk(),
+                    after.to_vk(),
+                    vk::DependencyFlags::empty(),
+                    &[barrier_info],
+                    &[],
+                    &[],
+                );
+            }
+        }
     }
     pub fn begin_render<'a>(&'a mut self, mut desc: RenderPassDesc) -> GPURenderPass<'a> {
         let mut sample_count = 0;
@@ -1168,7 +993,7 @@ impl GPUCommandBuffer {
                 .cmd_set_polygon_mode(self.command_buffer, vk::PolygonMode::FILL);
             self.gpu
                 .shader_object_device
-                .cmd_set_cull_mode(self.command_buffer, vk::CullModeFlags::NONE); //todo: configurable
+                .cmd_set_cull_mode(self.command_buffer, vk::CullModeFlags::NONE);
             self.gpu
                 .shader_object_device
                 .cmd_set_depth_compare_op(self.command_buffer, vk::CompareOp::ALWAYS); //todo
@@ -1293,16 +1118,16 @@ impl GPUCommandBuffer {
         texture_region: TextureRegion,
         src: GPUPointer,
     ) {
-        let aspect_mask = texture.format.to_vk_aspect_flags();
+        let aspect_mask = TextureFormat::aspect_flags(texture.format);
         let is_compressed = match texture.format {
-            TextureFormat::BC1RGBAUnorm
-            | TextureFormat::BC3RGBAUnorm
-            | TextureFormat::BC7RGBAUnorm
-            | TextureFormat::ASTC4x4RGBAUnorm
-            | TextureFormat::ETC2RGB8Unorm
-            | TextureFormat::ETC2RGBA8Unorm
-            | TextureFormat::EACR11Unorm
-            | TextureFormat::EACRG11Unorm => true,
+            vk::Format::BC1_RGBA_UNORM_BLOCK
+            | vk::Format::BC3_SRGB_BLOCK
+            | vk::Format::BC7_SRGB_BLOCK
+            | vk::Format::ASTC_4X4_SRGB_BLOCK
+            | vk::Format::ETC2_R8G8B8_UNORM_BLOCK
+            | vk::Format::ETC2_R8G8B8A8_UNORM_BLOCK
+            | vk::Format::EAC_R11_UNORM_BLOCK
+            | vk::Format::EAC_R11G11_UNORM_BLOCK => true,
             _ => false,
         };
         let mip_width = 1.max(texture.dimensions[0] >> texture_region.mip_level);
@@ -1345,8 +1170,31 @@ impl GPUCommandBuffer {
             )
         };
     }
-    pub fn submit(mut self) {
-        self.submitted = true;
+    pub fn submit(self) {}
+    pub fn bind_descriptor_heap(&self, heap: &GPUDescriptorHeap) {
+        let descriptor_sets = [heap.textures, heap.textures_rw, heap.samplers];
+        unsafe {
+            self.gpu.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.gpu.common_pipeline_graphics_layout,
+                0,
+                &descriptor_sets,
+                &[],
+            );
+            self.gpu.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.gpu.common_pipeline_compute_layout,
+                0,
+                &descriptor_sets,
+                &[],
+            );
+        };
+    }
+}
+impl Drop for GPUCommandBuffer {
+    fn drop(&mut self) {
         unsafe {
             self.gpu
                 .device
@@ -1402,34 +1250,6 @@ impl GPUCommandBuffer {
             },
         );
     }
-    pub fn bind_descriptor_heap(&self, heap: &GPUDescriptorHeap) {
-        let descriptor_sets = [heap.textures, heap.textures_rw, heap.samplers];
-        unsafe {
-            self.gpu.device.cmd_bind_descriptor_sets(
-                self.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.gpu.common_pipeline_graphics_layout,
-                0,
-                &descriptor_sets,
-                &[],
-            );
-            self.gpu.device.cmd_bind_descriptor_sets(
-                self.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.gpu.common_pipeline_compute_layout,
-                0,
-                &descriptor_sets,
-                &[],
-            );
-        };
-    }
-}
-impl Drop for GPUCommandBuffer {
-    fn drop(&mut self) {
-        if !self.submitted {
-            println!("buffer not submitted")
-        }
-    }
 }
 pub struct GPURenderPass<'a> {
     command_buffer: &'a mut GPUCommandBuffer,
@@ -1456,13 +1276,69 @@ impl GPURenderPass<'_> {
     pub fn set_shaders(&mut self, shaders: &GraphicsShaders) {
         self.set_shaders_individual(&shaders.vertex, &shaders.fragment);
     }
+    pub fn set_culling(&mut self, cull_mode: GPUCullMode) {
+        unsafe {
+            self.command_buffer
+                .gpu
+                .shader_object_device
+                .cmd_set_cull_mode(
+                    self.command_buffer.command_buffer,
+                    match cull_mode {
+                        GPUCullMode::KeepAll => vk::CullModeFlags::NONE,
+                        GPUCullMode::KeepCW => vk::CullModeFlags::FRONT,
+                        GPUCullMode::KeepCCW => vk::CullModeFlags::BACK,
+                    },
+                )
+        };
+    }
+    pub fn set_topology(&mut self, topology: GPUTopology) {
+        unsafe {
+            self.command_buffer
+                .gpu
+                .shader_object_device
+                .cmd_set_primitive_topology(
+                    self.command_buffer.command_buffer,
+                    match topology {
+                        GPUTopology::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
+                        GPUTopology::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
+                        GPUTopology::TriangleFan => vk::PrimitiveTopology::TRIANGLE_FAN,
+                    },
+                )
+        };
+    }
+    pub fn set_depth_test(&mut self, depth_config: Option<GPUDepthTestConfig>) {
+        unsafe {
+            self.command_buffer.gpu.device.cmd_set_depth_test_enable(
+                self.command_buffer.command_buffer,
+                depth_config.is_some(),
+            );
+            if let Some(depth_config) = depth_config {
+                self.command_buffer.gpu.device.cmd_set_depth_write_enable(
+                    self.command_buffer.command_buffer,
+                    depth_config.write,
+                );
+                self.command_buffer.gpu.device.cmd_set_depth_compare_op(
+                    self.command_buffer.command_buffer,
+                    match depth_config.compare {
+                        GPUCompareOp::Always => vk::CompareOp::ALWAYS,
+                        GPUCompareOp::Never => vk::CompareOp::NEVER,
+                        GPUCompareOp::Less => vk::CompareOp::LESS,
+                        GPUCompareOp::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
+                        GPUCompareOp::Greater => vk::CompareOp::GREATER,
+                        GPUCompareOp::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
+                        GPUCompareOp::Equal => vk::CompareOp::EQUAL,
+                        GPUCompareOp::NotEqual => vk::CompareOp::NOT_EQUAL,
+                    },
+                );
+            }
+        }
+    }
     pub fn draw<D: bytemuck::Pod>(
         &mut self,
         draw_data: D,
         count: u32,
         instance_count: u32,
         index_buffer: Option<(GPUPointer, IndexBufferFormat)>,
-        draw_options: DrawOptions,
     ) {
         let gpu = &self.command_buffer.gpu;
         assert!(
@@ -1521,12 +1397,6 @@ impl Drop for GPURenderPass<'_> {
         }
     }
 }
-pub struct DrawOptions {}
-impl Default for DrawOptions {
-    fn default() -> Self {
-        DrawOptions {}
-    }
-}
 pub struct RenderPassDesc<'a> {
     pub render_area_offset: [i32; 2],
     pub render_area_size: [u32; 2],
@@ -1557,17 +1427,17 @@ pub struct RenderPassAttachment<'a, C> {
     pub resolve: Option<(&'a GPUTexture, TextureViewDesc)>,
 }
 trait IntoClearValue: Copy {
-    fn into_clear_value(self, format: TextureFormat) -> vk::ClearValue;
+    fn into_clear_value(self, format: vk::Format) -> vk::ClearValue;
 }
 impl IntoClearValue for [f32; 4] {
-    fn into_clear_value(self, _format: TextureFormat) -> vk::ClearValue {
+    fn into_clear_value(self, _format: vk::Format) -> vk::ClearValue {
         vk::ClearValue {
             color: vk::ClearColorValue { float32: self },
         }
     }
 }
 impl IntoClearValue for f32 {
-    fn into_clear_value(self, _format: TextureFormat) -> vk::ClearValue {
+    fn into_clear_value(self, _format: vk::Format) -> vk::ClearValue {
         vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: self,
@@ -1577,7 +1447,7 @@ impl IntoClearValue for f32 {
     }
 }
 impl IntoClearValue for u32 {
-    fn into_clear_value(self, _format: TextureFormat) -> vk::ClearValue {
+    fn into_clear_value(self, _format: vk::Format) -> vk::ClearValue {
         vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: 0.,
@@ -1674,13 +1544,13 @@ pub enum TextureFormat {
     EACRG11Unorm,
 }
 impl TextureFormat {
-    fn to_vk_aspect_flags(self) -> vk::ImageAspectFlags {
-        match self {
-            TextureFormat::D16Unorm
-            | TextureFormat::D16UnormS8Uint
-            | TextureFormat::D24UnormPack32
-            | TextureFormat::D24UnormS8Uint
-            | TextureFormat::D32Float => vk::ImageAspectFlags::DEPTH,
+    fn aspect_flags(texture_format: vk::Format) -> vk::ImageAspectFlags {
+        match texture_format {
+            vk::Format::D16_UNORM
+            | vk::Format::D16_UNORM_S8_UINT
+            | vk::Format::X8_D24_UNORM_PACK32
+            | vk::Format::D24_UNORM_S8_UINT
+            | vk::Format::D32_SFLOAT => vk::ImageAspectFlags::DEPTH,
             _ => vk::ImageAspectFlags::COLOR,
         }
     }
@@ -1691,44 +1561,44 @@ impl TextureFormat {
             TextureFormat::RGBA8Unorm => vk::Format::R8G8B8A8_UNORM,
             TextureFormat::ABGR8Unorm => vk::Format::A8B8G8R8_UNORM_PACK32,
             TextureFormat::BGRA8Unorm => vk::Format::B8G8R8A8_UNORM,
-            TextureFormat::R8SRGB => todo!(),
-            TextureFormat::RG8SRGB => todo!(),
-            TextureFormat::RGBA8SRGB => todo!(),
-            TextureFormat::ABGR8SRGB => todo!(),
+            TextureFormat::R8SRGB => vk::Format::R8_SRGB,
+            TextureFormat::RG8SRGB => vk::Format::R8G8_SRGB,
+            TextureFormat::RGBA8SRGB => vk::Format::R8G8B8A8_SRGB,
+            TextureFormat::ABGR8SRGB => vk::Format::A8B8G8R8_SRGB_PACK32,
             TextureFormat::BGRA8SRGB => vk::Format::B8G8R8A8_SRGB,
-            TextureFormat::R16Unorm => todo!(),
-            TextureFormat::RG16Unorm => todo!(),
-            TextureFormat::RGBA16Unorm => todo!(),
-            TextureFormat::D16Unorm => todo!(),
-            TextureFormat::D16UnormS8Uint => todo!(),
-            TextureFormat::D24UnormPack32 => todo!(),
-            TextureFormat::D24UnormS8Uint => todo!(),
-            TextureFormat::D32Float => todo!(),
-            TextureFormat::R16Float => todo!(),
-            TextureFormat::RG16Float => todo!(),
-            TextureFormat::RGBA16Float => todo!(),
-            TextureFormat::R32Float => todo!(),
-            TextureFormat::RG32Float => todo!(),
-            TextureFormat::RGBA32Float => todo!(),
-            TextureFormat::BC1RGBAUnorm => todo!(),
-            TextureFormat::BC3RGBAUnorm => todo!(),
-            TextureFormat::BC4RUnorm => todo!(),
-            TextureFormat::BC5RGUnorm => todo!(),
-            TextureFormat::BC6HRGBFloat => todo!(),
-            TextureFormat::BC7RGBAUnorm => todo!(),
-            TextureFormat::BC7RGBASRGB => todo!(),
-            TextureFormat::ASTC4x4RGBAUnorm => todo!(),
-            TextureFormat::ETC2RGB8Unorm => todo!(),
-            TextureFormat::ETC2RGBA8Unorm => todo!(),
-            TextureFormat::EACR11Unorm => todo!(),
-            TextureFormat::EACRG11Unorm => todo!(),
+            TextureFormat::R16Unorm => vk::Format::R16_UNORM,
+            TextureFormat::RG16Unorm => vk::Format::R16G16_UNORM,
+            TextureFormat::RGBA16Unorm => vk::Format::R16G16B16A16_UNORM,
+            TextureFormat::D16Unorm => vk::Format::D16_UNORM,
+            TextureFormat::D16UnormS8Uint => vk::Format::D16_UNORM_S8_UINT,
+            TextureFormat::D24UnormPack32 => vk::Format::X8_D24_UNORM_PACK32,
+            TextureFormat::D24UnormS8Uint => vk::Format::D24_UNORM_S8_UINT,
+            TextureFormat::D32Float => vk::Format::D32_SFLOAT,
+            TextureFormat::R16Float => vk::Format::R16_SFLOAT,
+            TextureFormat::RG16Float => vk::Format::R16G16_SFLOAT,
+            TextureFormat::RGBA16Float => vk::Format::R16G16B16A16_SFLOAT,
+            TextureFormat::R32Float => vk::Format::R32_SFLOAT,
+            TextureFormat::RG32Float => vk::Format::R32G32_SFLOAT,
+            TextureFormat::RGBA32Float => vk::Format::R32G32B32A32_SFLOAT,
+            TextureFormat::BC1RGBAUnorm => vk::Format::BC1_RGBA_UNORM_BLOCK,
+            TextureFormat::BC3RGBAUnorm => vk::Format::BC3_UNORM_BLOCK,
+            TextureFormat::BC4RUnorm => vk::Format::BC4_UNORM_BLOCK,
+            TextureFormat::BC5RGUnorm => vk::Format::BC5_UNORM_BLOCK,
+            TextureFormat::BC6HRGBFloat => vk::Format::BC6H_SFLOAT_BLOCK,
+            TextureFormat::BC7RGBAUnorm => vk::Format::BC7_UNORM_BLOCK,
+            TextureFormat::BC7RGBASRGB => vk::Format::BC7_SRGB_BLOCK,
+            TextureFormat::ASTC4x4RGBAUnorm => vk::Format::ASTC_4X4_UNORM_BLOCK,
+            TextureFormat::ETC2RGB8Unorm => vk::Format::ETC2_R8G8B8_UNORM_BLOCK,
+            TextureFormat::ETC2RGBA8Unorm => vk::Format::ETC2_R8G8B8A8_UNORM_BLOCK,
+            TextureFormat::EACR11Unorm => vk::Format::EAC_R11_UNORM_BLOCK,
+            TextureFormat::EACRG11Unorm => vk::Format::EAC_R11G11_UNORM_BLOCK,
         }
     }
 }
 pub struct GPUTexture {
     texture_type: TextureType,
     dimensions: [u32; 3],
-    format: TextureFormat,
+    format: vk::Format,
     mip_count: u32,
     layer_count: u32,
     sample_count: u32,
@@ -1756,9 +1626,9 @@ impl GPUTexture {
                             &vk::ImageViewCreateInfo::default()
                                 .image(self.image.clone())
                                 .view_type(self.texture_type.to_view_vk())
-                                .format(self.format.to_vk())
+                                .format(self.format)
                                 .subresource_range(vk::ImageSubresourceRange {
-                                    aspect_mask: self.format.to_vk_aspect_flags(),
+                                    aspect_mask: TextureFormat::aspect_flags(self.format),
                                     base_array_layer: view_desc.base_layer as u32,
                                     base_mip_level: view_desc.base_mip,
                                     layer_count: view_desc.layer_count as u32,
@@ -1959,17 +1829,16 @@ impl GPUSwapchain {
         } else {
             surface_capabilities.current_transform
         };
-        let _present_modes = unsafe {
+        let present_modes = unsafe {
             gpu.surface_loader
                 .get_physical_device_surface_present_modes(gpu.physical_device, surface)
                 .unwrap()
         };
-        /*let present_mode = present_modes
-        .iter()
-        .cloned()
-        .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
-        .unwrap_or(vk::PresentModeKHR::FIFO);*/
-        let present_mode = vk::PresentModeKHR::FIFO;
+        let present_mode = present_modes
+            .iter()
+            .cloned()
+            .find(|&mode| mode == vk::PresentModeKHR::MAILBOX && !gpu.settings.vsync)
+            .unwrap_or(vk::PresentModeKHR::FIFO);
         let info = vk::SwapchainCreateInfoKHR::default()
             .min_image_count(desired_image_count)
             .image_color_space(surface_format.color_space)
@@ -1993,10 +1862,7 @@ impl GPUSwapchain {
             Arc::new(GPUTexture {
                 image,
                 dimensions: [surface_resolution.width, surface_resolution.height, 1],
-                format: match surface_format.format {
-                    vk::Format::B8G8R8A8_SRGB => TextureFormat::BGRA8SRGB,
-                    format => unimplemented!("{:?}", format),
-                },
+                format: surface_format.format,
                 layer_count: 1,
                 sample_count: 1,
                 mip_count: 1,
@@ -2236,7 +2102,22 @@ impl GPUArena {
             }
         }
     }
-    //pub fn alloc_multi_split<T: bytemuck::Pod>(&mut self, slice: &[T]) -> Vec<(GPUPointer, usize)>{}
+    pub fn alloc_multi_split<T: bytemuck::Pod>(&mut self, slice: &[T]) -> Vec<(GPUPointer, usize)> {
+        let block_max_fit = self.block_size / std::mem::size_of::<T>();
+        let mut output = Vec::new();
+        let full_count = slice.len() / block_max_fit;
+        for i in 0..full_count {
+            output.push((
+                self.alloc(&slice[(i * block_max_fit)..((i + 1) * block_max_fit)]),
+                block_max_fit,
+            ));
+        }
+        let reminder = slice.len() % block_max_fit;
+        if reminder > 0 {
+            output.push((self.alloc(&slice[(full_count * block_max_fit)..]), reminder));
+        }
+        output
+    }
     pub fn clear(&mut self) {
         self.block_index = 0;
         self.block_offset = 0;
@@ -2333,14 +2214,14 @@ impl Drop for GPUDescriptorHeap {
 }
 #[derive(Hash, Clone, Copy, PartialEq, Eq)]
 pub struct TextureSampler {
-    min: SamplerFilter,
-    mag: SamplerFilter,
-    mip: SamplerFilter,
-    u: SamplerAddressMode,
-    v: SamplerAddressMode,
-    w: SamplerAddressMode,
-    max_anisotropy: Option<u8>, //should be float, but then not eq
-    border: SamplerBorder,
+    pub min: SamplerFilter,
+    pub mag: SamplerFilter,
+    pub mip: SamplerFilter,
+    pub u: SamplerAddressMode,
+    pub v: SamplerAddressMode,
+    pub w: SamplerAddressMode,
+    pub max_anisotropy: Option<u8>, //should be float, but then not eq
+    pub border: SamplerBorder,
 }
 impl Default for TextureSampler {
     fn default() -> Self {
@@ -2411,10 +2292,11 @@ pub struct GPUSettings {
     pub desc_heap_max_samplers: usize,
     pub max_push_constant_size: usize,
     pub validate: bool,
+    pub vsync: bool,
     pub instance_extensions: Vec<*const i8>,
 }
 impl GPUSettings {
-    fn get_required_extensions(display: DisplayHandle) -> Vec<*const i8> {
+    pub fn get_required_extensions(display: DisplayHandle) -> Vec<*const i8> {
         ash_window::enumerate_required_extensions(display.as_raw())
             .unwrap()
             .to_vec()
@@ -2427,6 +2309,7 @@ impl Default for GPUSettings {
             desc_heap_max_samplers: 32,
             max_push_constant_size: 128,
             validate: true,
+            vsync: false,
             instance_extensions: Vec::new(),
         }
     }
@@ -2509,4 +2392,67 @@ impl IndexBufferFormat {
             IndexBufferFormat::U32 => 4,
         }
     }
+}
+#[derive(Clone, Copy)]
+pub enum GPUStage {
+    Transfer,
+    Compute,
+    RasterColorOut,
+    FragmentShader,
+    VertexShader,
+    All,
+}
+impl GPUStage {
+    fn to_vk(self) -> vk::PipelineStageFlags {
+        match self {
+            GPUStage::Transfer => vk::PipelineStageFlags::TRANSFER,
+            GPUStage::Compute => vk::PipelineStageFlags::COMPUTE_SHADER,
+            GPUStage::RasterColorOut => vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            GPUStage::FragmentShader => vk::PipelineStageFlags::FRAGMENT_SHADER,
+            GPUStage::VertexShader => vk::PipelineStageFlags::VERTEX_SHADER,
+            GPUStage::All => vk::PipelineStageFlags::ALL_COMMANDS,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub enum GPUHazard {
+    DrawArguments,
+    Descriptors,
+    DepthStencil,
+}
+#[derive(Clone, Copy)]
+pub enum GPUCullMode {
+    KeepAll,
+    KeepCW,
+    KeepCCW,
+}
+#[derive(Clone, Copy)]
+pub enum GPUTopology {
+    TriangleList,
+    TriangleStrip,
+    TriangleFan,
+}
+#[derive(Clone, Copy)]
+pub struct GPUDepthTestConfig {
+    write: bool,
+    compare: GPUCompareOp,
+}
+impl Default for GPUDepthTestConfig {
+    fn default() -> Self {
+        Self {
+            write: true,
+            compare: GPUCompareOp::Less,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub enum GPUCompareOp {
+    Always,
+    Never,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Equal,
+    NotEqual,
 }
