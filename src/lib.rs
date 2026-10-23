@@ -1333,14 +1333,14 @@ impl GPURenderPass<'_> {
             }
         }
     }
-    pub fn set_blend(&mut self, blend: Option<BlendState>) {
+    pub fn set_blend(&mut self, attachment: u32, blend: Option<BlendState>) {
         unsafe {
             self.command_buffer
                 .gpu
                 .shader_object_device
                 .cmd_set_color_blend_enable(
                     self.command_buffer.command_buffer,
-                    0,
+                    attachment,
                     &[blend.is_some() as u32],
                 );
             if let Some(blend) = blend {
@@ -1355,7 +1355,7 @@ impl GPURenderPass<'_> {
                     .shader_object_device
                     .cmd_set_color_blend_equation(
                         self.command_buffer.command_buffer,
-                        0,
+                        attachment,
                         &[equation],
                     );
             }
