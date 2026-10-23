@@ -409,21 +409,21 @@ impl GPU {
         entry_point_vertex: &str,
         entry_point_fragment: &str,
         specializations: &HashMap<u32, u32>,
-    ) -> VkResult<GraphicsShaders> {
-        Ok(GraphicsShaders {
+    ) -> GraphicsShaders {
+        GraphicsShaders {
             vertex: self.create_shader_spirv(
                 code,
                 entry_point_vertex,
                 ShaderKind::Vertex,
                 specializations,
-            )?,
+            ),
             fragment: self.create_shader_spirv(
                 code,
                 entry_point_fragment,
                 ShaderKind::Fragment,
                 specializations,
-            )?,
-        })
+            ),
+        }
     }
     pub fn create_shader_spirv(
         &self,
@@ -431,7 +431,7 @@ impl GPU {
         entry_point: &str,
         kind: ShaderKind,
         specializations: &HashMap<u32, u32>,
-    ) -> VkResult<GPUShader> {
+    ) -> GPUShader {
         let mut aligned_code = vec![0u32; code.len().div_ceil(4)];
         let aligned_code =
             &mut bytemuck::cast_slice_mut::<_, u8>(aligned_code.as_mut_slice())[..code.len()];
@@ -486,11 +486,11 @@ impl GPU {
                 .create_shaders(&[shader_create_info], None)
                 .unwrap()[0] //todo: error handling
         };
-        Ok(GPUShader {
+        GPUShader {
             shader,
             kind,
             gpu: self.weak.upgrade().unwrap(),
-        })
+        }
     }
     pub fn begin_commands(&self, queue: QueueKind) -> GPUCommandBuffer {
         let mut local = self
@@ -1330,6 +1330,34 @@ impl GPURenderPass<'_> {
                         GPUCompareOp::NotEqual => vk::CompareOp::NOT_EQUAL,
                     },
                 );
+            }
+        }
+    }
+    pub fn set_blend(&mut self, blend: Option<BlendState>) {
+        unsafe {
+            self.command_buffer
+                .gpu
+                .shader_object_device
+                .cmd_set_color_blend_enable(
+                    self.command_buffer.command_buffer,
+                    0,
+                    &[blend.is_some() as u32],
+                );
+            if let Some(blend) = blend {
+                let equation = vk::ColorBlendEquationEXT::default()
+                    .alpha_blend_op(blend.alpha_op.to_vk())
+                    .color_blend_op(blend.color_op.to_vk())
+                    .src_alpha_blend_factor(blend.src_alpha_factor.to_vk())
+                    .src_color_blend_factor(blend.src_color_factor.to_vk())
+                    .dst_alpha_blend_factor(blend.dst_alpha_factor.to_vk());
+                self.command_buffer
+                    .gpu
+                    .shader_object_device
+                    .cmd_set_color_blend_equation(
+                        self.command_buffer.command_buffer,
+                        0,
+                        &[equation],
+                    );
             }
         }
     }
@@ -2455,4 +2483,61 @@ pub enum GPUCompareOp {
     GreaterEqual,
     Equal,
     NotEqual,
+}
+pub struct BlendState {
+    pub color_op: BlendOp,
+    pub src_color_factor: BlendFactor,
+    pub dst_color_factor: BlendFactor,
+    pub alpha_op: BlendOp,
+    pub src_alpha_factor: BlendFactor,
+    pub dst_alpha_factor: BlendFactor,
+    //color_write_mask: ColorComponentFlags,
+}
+#[derive(Clone, Copy)]
+pub enum BlendOp {
+    Add,
+    Subtract,
+    RevSubtract,
+    Min,
+    Max,
+}
+impl BlendOp {
+    fn to_vk(self) -> vk::BlendOp {
+        match self {
+            BlendOp::Add => vk::BlendOp::ADD,
+            BlendOp::Subtract => vk::BlendOp::SUBTRACT,
+            BlendOp::RevSubtract => vk::BlendOp::REVERSE_SUBTRACT,
+            BlendOp::Min => vk::BlendOp::MIN,
+            BlendOp::Max => vk::BlendOp::MAX,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    SrcColor,
+    DstColor,
+    SrcAlpha,
+    DstAlpha,
+    OneMinusSrcAlpha,
+    OneMinusSrcColor,
+    OneMinusDstAlpha,
+    OneMinusDstColor,
+}
+impl BlendFactor {
+    fn to_vk(self) -> vk::BlendFactor {
+        match self {
+            BlendFactor::Zero => vk::BlendFactor::ZERO,
+            BlendFactor::One => vk::BlendFactor::ONE,
+            BlendFactor::SrcColor => vk::BlendFactor::SRC_COLOR,
+            BlendFactor::DstColor => vk::BlendFactor::DST_COLOR,
+            BlendFactor::SrcAlpha => vk::BlendFactor::SRC_ALPHA,
+            BlendFactor::DstAlpha => vk::BlendFactor::DST_ALPHA,
+            BlendFactor::OneMinusSrcAlpha => vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            BlendFactor::OneMinusSrcColor => vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+            BlendFactor::OneMinusDstAlpha => vk::BlendFactor::ONE_MINUS_DST_ALPHA,
+            BlendFactor::OneMinusDstColor => vk::BlendFactor::ONE_MINUS_DST_COLOR,
+        }
+    }
 }
