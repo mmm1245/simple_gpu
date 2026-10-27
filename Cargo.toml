@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 ash = { version = "0.38", features = ["linked"] }
 ash-window = "0.13.0"
-bytemuck = { version = "1.25.2" }
+bytemuck = { version = "1.25.2", features = ["derive"] }
 gpu-allocator = { version = "0.28.0", features = [
     "vulkan",
     "std",
