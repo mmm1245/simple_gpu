@@ -2,7 +2,7 @@ use std::{
     alloc::Layout,
     cell::RefCell,
     collections::{BinaryHeap, HashMap, HashSet},
-    ffi::CString,
+    ffi::{CStr, CString},
     marker::PhantomData,
     sync::{Arc, Mutex, Weak},
 };
@@ -55,11 +55,16 @@ impl GPU {
             if settings.validate {
                 enabled_layer_names.push("VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8);
             }
+            let instance_extensions = settings
+                .instance_extensions
+                .iter()
+                .map(|ext| ext.as_ptr())
+                .collect::<Vec<_>>();
             let create_info = vk::InstanceCreateInfo {
                 p_application_info: &app_info,
                 ..Default::default()
             }
-            .enabled_extension_names(&settings.instance_extensions)
+            .enabled_extension_names(&instance_extensions)
             .enabled_layer_names(&enabled_layer_names);
             let instance = entry.create_instance(&create_info, None)?;
 
@@ -2469,13 +2474,15 @@ pub struct GPUSettings {
     pub max_push_constant_size: usize,
     pub validate: bool,
     pub vsync: bool,
-    pub instance_extensions: Vec<*const i8>,
+    pub instance_extensions: Vec<CString>,
 }
 impl GPUSettings {
-    pub fn get_required_extensions(display: DisplayHandle) -> Vec<*const i8> {
+    pub fn get_required_extensions(display: DisplayHandle) -> Vec<CString> {
         ash_window::enumerate_required_extensions(display.as_raw())
             .unwrap()
-            .to_vec()
+            .iter()
+            .map(|ext| unsafe { CStr::from_ptr(*ext) }.to_owned())
+            .collect()
     }
 }
 impl Default for GPUSettings {
